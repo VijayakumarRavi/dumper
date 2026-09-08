@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use chrono::Utc;
 use reqwest::{Client, Method, Response, StatusCode};
+use rand::Rng;
 use crate::error::DumperError;
 use crate::repository::backend::StorageBackend;
 use crate::repository::s3::sigv4::SigV4Signer;
@@ -146,10 +147,19 @@ impl S3Client {
                         return Ok(resp);
                     }
 
+                    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                        let err_body = resp.text().await.unwrap_or_default();
+                        return Err(DumperError::S3(format!(
+                            "S3 Authentication/Authorization failed: HTTP {} error on {} {}: {}",
+                            status, method, key, err_body
+                        )));
+                    }
+
                     if (status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS)
                         && attempt < max_retries
                     {
-                        tokio::time::sleep(delay).await;
+                        let jitter = rand::thread_rng().gen_range(0..100);
+                        tokio::time::sleep(delay + Duration::from_millis(jitter)).await;
                         delay *= 2;
                         continue;
                     }
@@ -162,7 +172,8 @@ impl S3Client {
                 }
                 Err(e) => {
                     if attempt < max_retries {
-                        tokio::time::sleep(delay).await;
+                        let jitter = rand::thread_rng().gen_range(0..100);
+                        tokio::time::sleep(delay + Duration::from_millis(jitter)).await;
                         delay *= 2;
                         continue;
                     }
