@@ -15,6 +15,16 @@ pub struct RepositoryEngine<B: StorageBackend> {
     pub config: RepositoryConfig,
 }
 
+impl<B: StorageBackend> Clone for RepositoryEngine<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+            master_key: self.master_key,
+            config: self.config.clone(),
+        }
+    }
+}
+
 impl<B: StorageBackend> RepositoryEngine<B> {
     /// Initialize a new repository with password
     pub async fn init(backend: Arc<B>, password: &str) -> Result<Self, DumperError> {

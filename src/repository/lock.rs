@@ -58,7 +58,7 @@ impl RepositoryLock {
 
         let info = LockInfo {
             lock_id: lock_id.clone(),
-            lock_type,
+            lock_type: lock_type.clone(),
             hostname,
             pid,
             created_at: Utc::now(),
@@ -67,6 +67,32 @@ impl RepositoryLock {
         let path = format!("locks/{}", lock_id);
         let data = serde_json::to_vec(&info)?;
         backend.put_object(&path, &data).await?;
+
+        // Phase 2: Verify lock acquisition
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        
+        let verify_locks = Self::list_active_locks(backend).await?;
+        for existing in &verify_locks {
+            if existing.lock_id == lock_id {
+                continue;
+            }
+            
+            let is_conflict = match lock_type {
+                LockType::Exclusive => true,
+                LockType::Shared => existing.lock_type == LockType::Exclusive,
+            };
+            
+            if is_conflict {
+                // Yield to older locks or same timestamp but lower lock ID (tie-breaker)
+                if existing.created_at < info.created_at || (existing.created_at == info.created_at && existing.lock_id < info.lock_id) {
+                    let _ = backend.delete_object(&path).await;
+                    return Err(DumperError::Repository(format!(
+                        "Concurrent lock acquisition detected. Yielded to lock by {} (pid: {})",
+                        existing.hostname, existing.pid
+                    )));
+                }
+            }
+        }
 
         Ok(Self { info, path })
     }
