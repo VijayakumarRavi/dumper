@@ -1,4 +1,4 @@
-use std::io::Write;
+use tokio::io::{AsyncWrite, AsyncRead};
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
@@ -82,7 +82,7 @@ impl DatabaseAdapter for PostgresAdapter {
         })
     }
 
-    async fn backup<W: Write + Send>(
+    async fn backup<W: AsyncWrite + Unpin + Send>(
         &self,
         encoder: &mut StreamEncoder<W>,
     ) -> Result<BackupStats, DumperError> {
@@ -105,7 +105,7 @@ impl DatabaseAdapter for PostgresAdapter {
             dumper_version: env!("CARGO_PKG_VERSION").into(),
             start_time: chrono::Utc::now().timestamp(),
         };
-        encoder.write_record(&StreamRecord::Header(header))?;
+        encoder.write_record(&StreamRecord::Header(header)).await?;
 
         // 3. User Schemas
         let schema_rows = client
@@ -125,8 +125,38 @@ impl DatabaseAdapter for PostgresAdapter {
                 encoder.write_record(&StreamRecord::PreData(PreDataRecord {
                     name: schema.clone(),
                     sql: format!("CREATE SCHEMA IF NOT EXISTS \"{}\";", schema),
-                }))?;
+                })).await?;
             }
+        }
+
+        // 3.5 Custom Types (ENUM, DOMAIN)
+        let type_rows = client
+            .query(
+                "SELECT n.nspname, t.typname, 
+                  CASE 
+                    WHEN t.typtype = 'e' THEN 'CREATE TYPE \"' || n.nspname || '\".\"' || t.typname || '\" AS ENUM (' || 
+                      (SELECT string_agg(quote_literal(enumlabel), ', ') FROM pg_enum WHERE enumtypid = t.oid) || ');'
+                    WHEN t.typtype = 'd' THEN 'CREATE DOMAIN \"' || n.nspname || '\".\"' || t.typname || '\" AS ' || format_type(t.typbasetype, t.typtypmod) || 
+                      COALESCE(' DEFAULT ' || t.typdefault, '') || ';'
+                  END as def
+                FROM pg_type t
+                JOIN pg_namespace n ON n.oid = t.typnamespace
+                WHERE t.typtype IN ('e', 'd') 
+                  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                  AND n.nspname NOT LIKE 'pg_temp_%'",
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        for row in type_rows {
+            let schema: String = row.get(0);
+            let name: String = row.get(1);
+            let def: String = row.get(2);
+            encoder.write_record(&StreamRecord::PreData(PreDataRecord {
+                name: format!("{}.{}", schema, name),
+                sql: def,
+            })).await?;
         }
 
         // 4. Tables and Streaming COPY Data
@@ -185,7 +215,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 table_name: table.clone(),
                 columns,
                 create_sql,
-            }))?;
+            })).await?;
 
             // Stream COPY Data directly
             let copy_sql = format!("COPY \"{}\".\"{}\" TO STDOUT (FORMAT binary)", schema, table);
@@ -206,7 +236,7 @@ impl DatabaseAdapter for PostgresAdapter {
                     slice_seq,
                     is_last: false,
                     data: chunk.to_vec(),
-                }))?;
+                })).await?;
             }
 
             // Signal end of table slice
@@ -216,7 +246,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 slice_seq: slice_seq + 1,
                 is_last: true,
                 data: Vec::new(),
-            }))?;
+            })).await?;
 
             tables_backed_up += 1;
         }
@@ -247,17 +277,19 @@ impl DatabaseAdapter for PostgresAdapter {
                     sequence_name: seq,
                     last_value,
                     is_called,
-                }))?;
+                })).await?;
             }
         }
 
-        // 6. Views
+        // 6. Views & Materialized Views
         let view_rows = client
             .query(
-                "SELECT table_schema, table_name, view_definition \
-                 FROM information_schema.views \
-                 WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                 ORDER BY table_schema, table_name",
+                "SELECT n.nspname, c.relname, pg_get_viewdef(c.oid), c.relkind
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relkind IN ('v', 'm')
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                 ORDER BY n.nspname, c.relname",
                 &[],
             )
             .await
@@ -267,16 +299,50 @@ impl DatabaseAdapter for PostgresAdapter {
             let schema: String = vrow.get(0);
             let view_name: String = vrow.get(1);
             let view_def: String = vrow.get(2);
-            let sql = format!("CREATE OR REPLACE VIEW \"{}\".\"{}\" AS {}", schema, view_name, view_def);
+            let relkind: i8 = vrow.get(3);
+            let sql = if relkind == b'm' as i8 {
+                format!("CREATE MATERIALIZED VIEW \"{}\".\"{}\" AS {}", schema, view_name, view_def)
+            } else {
+                format!("CREATE OR REPLACE VIEW \"{}\".\"{}\" AS {}", schema, view_name, view_def)
+            };
+            let r_type = if relkind == b'm' as i8 { "MATERIALIZED_VIEW" } else { "VIEW" };
             encoder.write_record(&StreamRecord::Routine(RoutineRecord {
                 schema_name: schema,
                 name: view_name,
-                routine_type: "VIEW".into(),
+                routine_type: r_type.into(),
                 sql,
-            }))?;
+            })).await?;
         }
 
-        // 7. Secondary Indexes
+
+
+        // 7. Functions
+        let func_rows = client
+            .query(
+                "SELECT n.nspname, p.proname, pg_get_functiondef(p.oid)
+                 FROM pg_proc p
+                 JOIN pg_namespace n ON n.oid = p.pronamespace
+                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                   AND n.nspname NOT LIKE 'pg_temp_%'",
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        for row in func_rows {
+            let schema: String = row.get(0);
+            let func_name: String = row.get(1);
+            if let Some(func_def) = row.get::<_, Option<String>>(2) {
+                encoder.write_record(&StreamRecord::Routine(RoutineRecord {
+                    schema_name: schema,
+                    name: func_name,
+                    routine_type: "FUNCTION".into(),
+                    sql: func_def,
+                })).await?;
+            }
+        }
+
+        // 8. Secondary Indexes
         let index_rows = client
             .query(
                 "SELECT schemaname, tablename, indexname, indexdef \
@@ -299,7 +365,63 @@ impl DatabaseAdapter for PostgresAdapter {
                 table_name: table,
                 name: index_name,
                 sql: format!("{};", index_def),
-            }))?;
+            })).await?;
+        }
+
+        // 9. Constraints (Primary, Foreign, Unique, Check)
+        let constraint_rows = client
+            .query(
+                "SELECT n.nspname, c.relname, con.conname, pg_get_constraintdef(con.oid), con.contype
+                 FROM pg_constraint con
+                 JOIN pg_class c ON c.oid = con.conrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                   AND n.nspname NOT LIKE 'pg_temp_%'
+                   AND con.contype IN ('p', 'f', 'u', 'c')
+                 ORDER BY con.contype DESC", // Primary keys 'p', then others
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        for row in constraint_rows {
+            let schema: String = row.get(0);
+            let table: String = row.get(1);
+            let name: String = row.get(2);
+            let def: String = row.get(3);
+            encoder.write_record(&StreamRecord::PostData(PostDataRecord {
+                schema_name: schema.clone(),
+                table_name: table.clone(),
+                name: name.clone(),
+                sql: format!("ALTER TABLE \"{}\".\"{}\" ADD CONSTRAINT \"{}\" {};", schema, table, name, def),
+            })).await?;
+        }
+
+        // 10. Triggers
+        let trigger_rows = client
+            .query(
+                "SELECT n.nspname, c.relname, t.tgname, pg_get_triggerdef(t.oid)
+                 FROM pg_trigger t
+                 JOIN pg_class c ON t.tgrelid = c.oid
+                 JOIN pg_namespace n ON c.relnamespace = n.oid
+                 WHERE NOT t.tgisinternal
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')",
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        for row in trigger_rows {
+            let schema: String = row.get(0);
+            let table: String = row.get(1);
+            let name: String = row.get(2);
+            let def: String = row.get(3);
+            encoder.write_record(&StreamRecord::PostData(PostDataRecord {
+                schema_name: schema,
+                table_name: table,
+                name,
+                sql: format!("{};", def),
+            })).await?;
         }
 
         // Commit/End read transaction
@@ -315,7 +437,7 @@ impl DatabaseAdapter for PostgresAdapter {
         })
     }
 
-    async fn restore<R: std::io::Read + Send>(
+    async fn restore<R: AsyncRead + Unpin + Send>(
         &self,
         decoder: &mut StreamDecoder<R>,
         options: &RestoreOptions,
@@ -328,7 +450,7 @@ impl DatabaseAdapter for PostgresAdapter {
         // Pending COPY sink handle
         let mut active_copy_sink: Option<(String, String, std::pin::Pin<Box<tokio_postgres::CopyInSink<bytes::Bytes>>>)> = None;
 
-        while let Some(record) = decoder.read_next_record()? {
+        while let Some(record) = decoder.read_next_record().await? {
             records_processed += 1;
             match record {
                 StreamRecord::Header(h) => {
