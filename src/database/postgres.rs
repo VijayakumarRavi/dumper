@@ -1,0 +1,413 @@
+use std::io::Write;
+use futures_util::pin_mut;
+use futures_util::stream::StreamExt;
+use futures_util::SinkExt;
+use tokio_postgres::{Client, NoTls};
+use crate::database::{BackupStats, DatabaseAdapter, DatabaseMeta, RestoreOptions, RestoreStats};
+use crate::error::DumperError;
+use crate::stream::decoder::StreamDecoder;
+use crate::stream::encoder::StreamEncoder;
+use crate::stream::format::*;
+
+pub struct PostgresAdapter {
+    url: String,
+}
+
+impl PostgresAdapter {
+    pub fn new(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+        }
+    }
+
+    async fn connect(&self) -> Result<Client, DumperError> {
+        let (client, connection) = tokio_postgres::connect(&self.url, NoTls)
+            .await
+            .map_err(|e| DumperError::Database(format!("PostgreSQL connection failed: {}", e)))?;
+
+        // Spawn connection runner in background
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("PostgreSQL connection error: {}", e);
+            }
+        });
+
+        Ok(client)
+    }
+}
+
+impl DatabaseAdapter for PostgresAdapter {
+    async fn inspect(&self) -> Result<DatabaseMeta, DumperError> {
+        let client = self.connect().await?;
+
+        let version_row = client
+            .query_one("SELECT version()", &[])
+            .await
+            .map_err(|e| DumperError::Database(e.to_string()))?;
+        let full_version: String = version_row.get(0);
+        let server_version = full_version.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+
+        let db_row = client
+            .query_one("SELECT current_database()", &[])
+            .await
+            .map_err(|e| DumperError::Database(e.to_string()))?;
+        let database: String = db_row.get(0);
+
+        let table_rows = client
+            .query(
+                "SELECT n.nspname, c.relname \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind = 'r' \
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+                   AND n.nspname NOT LIKE 'pg_temp_%' \
+                 ORDER BY n.nspname, c.relname",
+                &[],
+            )
+            .await
+            .map_err(|e| DumperError::Database(e.to_string()))?;
+
+        let mut table_names = Vec::new();
+        for row in table_rows {
+            let schema: String = row.get(0);
+            let table: String = row.get(1);
+            table_names.push((schema, table));
+        }
+
+        Ok(DatabaseMeta {
+            engine: "postgresql".into(),
+            database,
+            server_version,
+            table_names,
+        })
+    }
+
+    async fn backup<W: Write + Send>(
+        &self,
+        encoder: &mut StreamEncoder<W>,
+    ) -> Result<BackupStats, DumperError> {
+        let client = self.connect().await?;
+
+        // 1. Consistent Snapshot via Repeatable Read isolation
+        client
+            .batch_execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;")
+            .await
+            .map_err(|e| DumperError::Database(format!("Failed to start repeatable-read transaction: {}", e)))?;
+
+        let meta = self.inspect().await?;
+
+        // 2. Stream Header
+        let header = StreamHeader {
+            version: STREAM_VERSION,
+            engine: meta.engine.clone(),
+            database: meta.database.clone(),
+            server_version: meta.server_version.clone(),
+            dumper_version: env!("CARGO_PKG_VERSION").into(),
+            start_time: chrono::Utc::now().timestamp(),
+        };
+        encoder.write_record(&StreamRecord::Header(header))?;
+
+        // 3. User Schemas
+        let schema_rows = client
+            .query(
+                "SELECT nspname FROM pg_namespace \
+                 WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+                   AND nspname NOT LIKE 'pg_temp_%' \
+                 ORDER BY nspname",
+                &[],
+            )
+            .await
+            .map_err(|e| DumperError::Database(e.to_string()))?;
+
+        for row in schema_rows {
+            let schema: String = row.get(0);
+            if schema != "public" {
+                encoder.write_record(&StreamRecord::PreData(PreDataRecord {
+                    name: schema.clone(),
+                    sql: format!("CREATE SCHEMA IF NOT EXISTS \"{}\";", schema),
+                }))?;
+            }
+        }
+
+        // 4. Tables and Streaming COPY Data
+        let mut tables_backed_up = 0;
+        let total_rows = 0u64;
+
+        for (schema, table) in &meta.table_names {
+            // Columns metadata
+            let col_rows = client
+                .query(
+                    "SELECT column_name, data_type, is_nullable, column_default \
+                     FROM information_schema.columns \
+                     WHERE table_schema = $1 AND table_name = $2 \
+                     ORDER BY ordinal_position",
+                    &[schema, table],
+                )
+                .await
+                .map_err(|e| DumperError::Database(e.to_string()))?;
+
+            let mut columns = Vec::new();
+            let mut col_defs = Vec::new();
+
+            for crow in col_rows {
+                let col_name: String = crow.get(0);
+                let data_type: String = crow.get(1);
+                let is_null_str: String = crow.get(2);
+                let is_nullable = is_null_str.eq_ignore_ascii_case("yes");
+                let default_val: Option<String> = crow.get(3);
+
+                let mut def = format!("\"{}\" {}", col_name, data_type);
+                if !is_nullable {
+                    def.push_str(" NOT NULL");
+                }
+                if let Some(ref d) = default_val {
+                    def.push_str(&format!(" DEFAULT {}", d));
+                }
+                col_defs.push(def);
+
+                columns.push(TableColumnMeta {
+                    name: col_name,
+                    data_type,
+                    is_nullable,
+                    default_val,
+                });
+            }
+
+            let create_sql = format!(
+                "CREATE TABLE IF NOT EXISTS \"{}\".\"{}\" ({});",
+                schema,
+                table,
+                col_defs.join(", ")
+            );
+
+            encoder.write_record(&StreamRecord::TableSchema(TableSchemaRecord {
+                schema_name: schema.clone(),
+                table_name: table.clone(),
+                columns,
+                create_sql,
+            }))?;
+
+            // Stream COPY Data directly
+            let copy_sql = format!("COPY \"{}\".\"{}\" TO STDOUT (FORMAT binary)", schema, table);
+            let copy_out = client
+                .copy_out(&copy_sql)
+                .await
+                .map_err(|e| DumperError::Database(format!("COPY OUT failed for {}.{}: {}", schema, table, e)))?;
+
+            pin_mut!(copy_out);
+            let mut slice_seq = 0u64;
+
+            while let Some(chunk_res) = copy_out.next().await {
+                let chunk = chunk_res.map_err(|e| DumperError::Database(format!("COPY read error: {}", e)))?;
+                slice_seq += 1;
+                encoder.write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
+                    schema_name: schema.clone(),
+                    table_name: table.clone(),
+                    slice_seq,
+                    is_last: false,
+                    data: chunk.to_vec(),
+                }))?;
+            }
+
+            // Signal end of table slice
+            encoder.write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
+                schema_name: schema.clone(),
+                table_name: table.clone(),
+                slice_seq: slice_seq + 1,
+                is_last: true,
+                data: Vec::new(),
+            }))?;
+
+            tables_backed_up += 1;
+        }
+
+        // 5. Sequences
+        let seq_rows = client
+            .query(
+                "SELECT n.nspname, c.relname \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind = 'S' \
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY n.nspname, c.relname",
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        for srow in seq_rows {
+            let schema: String = srow.get(0);
+            let seq: String = srow.get(1);
+            let seq_val_sql = format!("SELECT last_value, is_called FROM \"{}\".\"{}\"", schema, seq);
+            if let Ok(val_row) = client.query_one(&seq_val_sql, &[]) .await {
+                let last_value: i64 = val_row.get(0);
+                let is_called: bool = val_row.get(1);
+                encoder.write_record(&StreamRecord::Sequence(SequenceRecord {
+                    schema_name: schema,
+                    sequence_name: seq,
+                    last_value,
+                    is_called,
+                }))?;
+            }
+        }
+
+        // 6. Views
+        let view_rows = client
+            .query(
+                "SELECT table_schema, table_name, view_definition \
+                 FROM information_schema.views \
+                 WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY table_schema, table_name",
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        for vrow in view_rows {
+            let schema: String = vrow.get(0);
+            let view_name: String = vrow.get(1);
+            let view_def: String = vrow.get(2);
+            let sql = format!("CREATE OR REPLACE VIEW \"{}\".\"{}\" AS {}", schema, view_name, view_def);
+            encoder.write_record(&StreamRecord::Routine(RoutineRecord {
+                schema_name: schema,
+                name: view_name,
+                routine_type: "VIEW".into(),
+                sql,
+            }))?;
+        }
+
+        // 7. Secondary Indexes
+        let index_rows = client
+            .query(
+                "SELECT schemaname, tablename, indexname, indexdef \
+                 FROM pg_indexes \
+                 WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
+                   AND indexname NOT LIKE '%_pkey' \
+                 ORDER BY schemaname, tablename, indexname",
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        for irow in index_rows {
+            let schema: String = irow.get(0);
+            let table: String = irow.get(1);
+            let index_name: String = irow.get(2);
+            let index_def: String = irow.get(3);
+            encoder.write_record(&StreamRecord::PostData(PostDataRecord {
+                schema_name: schema,
+                table_name: table,
+                name: index_name,
+                sql: format!("{};", index_def),
+            }))?;
+        }
+
+        // Commit/End read transaction
+        let _ = client.batch_execute("COMMIT;").await;
+
+        Ok(BackupStats {
+            engine: meta.engine,
+            database: meta.database,
+            server_version: meta.server_version,
+            tables_backed_up,
+            rows_backed_up: total_rows,
+            logical_bytes: encoder.bytes_written(),
+        })
+    }
+
+    async fn restore<R: std::io::Read + Send>(
+        &self,
+        decoder: &mut StreamDecoder<R>,
+        options: &RestoreOptions,
+    ) -> Result<RestoreStats, DumperError> {
+        let client = self.connect().await?;
+
+        let mut tables_restored = 0;
+        let mut records_processed = 0u64;
+
+        // Pending COPY sink handle
+        let mut active_copy_sink: Option<(String, String, std::pin::Pin<Box<tokio_postgres::CopyInSink<bytes::Bytes>>>)> = None;
+
+        while let Some(record) = decoder.read_next_record()? {
+            records_processed += 1;
+            match record {
+                StreamRecord::Header(h) => {
+                    // Check compatibility
+                    if h.engine != "postgresql" {
+                        return Err(DumperError::Restore(format!(
+                            "Cannot restore a '{}' backup into a PostgreSQL target database",
+                            h.engine
+                        )));
+                    }
+                }
+                StreamRecord::PreData(p) => {
+                    client.batch_execute(&p.sql).await.map_err(|e| {
+                        DumperError::Restore(format!("Failed to execute pre-data DDL: {}", e))
+                    })?;
+                }
+                StreamRecord::TableSchema(s) => {
+                    if options.drop_existing {
+                        let drop_sql = format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE;", s.schema_name, s.table_name);
+                        let _ = client.batch_execute(&drop_sql).await;
+                    }
+                    client.batch_execute(&s.create_sql).await.map_err(|e| {
+                        DumperError::Restore(format!("Failed to create table {}.{}: {}", s.schema_name, s.table_name, e))
+                    })?;
+                    tables_restored += 1;
+                }
+                StreamRecord::TableDataSlice(d) => {
+                    // Ensure active COPY sink is initialized for this table
+                    let needs_new_sink = match active_copy_sink {
+                        Some((ref s, ref t, _)) => s != &d.schema_name || t != &d.table_name,
+                        None => true,
+                    };
+
+                    if needs_new_sink && !d.is_last {
+                        let copy_sql = format!("COPY \"{}\".\"{}\" FROM STDIN (FORMAT binary)", d.schema_name, d.table_name);
+                        let sink = Box::pin(client.copy_in(&copy_sql).await.map_err(|e| {
+                            DumperError::Restore(format!("COPY IN initialization failed for {}.{}: {}", d.schema_name, d.table_name, e))
+                        })?);
+                        active_copy_sink = Some((d.schema_name.clone(), d.table_name.clone(), sink));
+                    }
+
+                    if let Some((_, _, ref mut sink)) = active_copy_sink {
+                        if !d.data.is_empty() {
+                            sink.as_mut().feed(bytes::Bytes::from(d.data)).await.map_err(|e| {
+                                DumperError::Restore(format!("COPY IN data write failed: {}", e))
+                            })?;
+                        }
+                    }
+
+                    if d.is_last {
+                        if let Some((_, _, mut sink)) = active_copy_sink.take() {
+                            sink.as_mut().finish().await.map_err(|e| {
+                                DumperError::Restore(format!("COPY IN finish failed for {}.{}: {}", d.schema_name, d.table_name, e))
+                            })?;
+                        }
+                    }
+                }
+                StreamRecord::Sequence(seq) => {
+                    let setval_sql = format!(
+                        "SELECT setval('\"{}\".\"{}\"', {}, {});",
+                        seq.schema_name, seq.sequence_name, seq.last_value, seq.is_called
+                    );
+                    let _ = client.batch_execute(&setval_sql).await;
+                }
+                StreamRecord::PostData(post) => {
+                    let _ = client.batch_execute(&post.sql).await;
+                }
+                StreamRecord::Routine(routine) => {
+                    let _ = client.batch_execute(&routine.sql).await;
+                }
+                StreamRecord::Trailer(_) => {
+                    break;
+                }
+            }
+        }
+
+        Ok(RestoreStats {
+            tables_restored,
+            records_processed,
+        })
+    }
+}

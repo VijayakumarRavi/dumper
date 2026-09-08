@@ -1,0 +1,54 @@
+[package]
+name = "dumper"
+version = "0.1.0"
+edition = "2021"
+authors = ["Dumper Maintainers"]
+description = "A tiny, production-grade database backup, restore, verification, retention, and repository-management CLI"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["backup", "database", "postgres", "mysql", "s3"]
+categories = ["command-line-utilities", "database"]
+
+[dependencies]
+# Async Runtime (lightweight single-threaded or current-thread)
+tokio = { version = "1.43", default-features = false, features = ["rt", "macros", "time", "sync", "io-util", "net", "fs", "signal"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
+bytes = { version = "1.9", default-features = false }
+
+# CLI Parsing
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+
+# Cryptography
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+crc32fast = { version = "1.4", default-features = false, features = ["std"] }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# Compression
+zstd = { version = "0.13", default-features = false }
+
+# Serialization & Datetimes
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+
+# HTTP & URLs (for S3 API)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "stream"] }
+url = { version = "2.5", default-features = false }
+
+# Database Wire Protocols
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
+
+[dev-dependencies]
+tempfile = "3.17"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
