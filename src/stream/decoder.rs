@@ -1,17 +1,19 @@
-use std::io::Read;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use crc32fast::Hasher as CrcHasher;
 use crate::error::DumperError;
 use crate::stream::format::*;
+use sha2::{Digest, Sha256};
 
-pub struct StreamDecoder<R: Read> {
+pub struct StreamDecoder<R: AsyncRead + Unpin + Send> {
     reader: R,
     magic_checked: bool,
     records_read: u64,
     bytes_read: u64,
     reached_eof: bool,
+    stream_hasher: Sha256,
 }
 
-impl<R: Read> StreamDecoder<R> {
+impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
     pub fn new(reader: R) -> Self {
         Self {
             reader,
@@ -19,14 +21,15 @@ impl<R: Read> StreamDecoder<R> {
             records_read: 0,
             bytes_read: 0,
             reached_eof: false,
+            stream_hasher: Sha256::new(),
         }
     }
 
-    fn check_magic(&mut self) -> Result<(), DumperError> {
+    async fn check_magic(&mut self) -> Result<(), DumperError> {
         if !self.magic_checked {
             let mut magic = [0u8; 4];
             self.reader
-                .read_exact(&mut magic)
+                .read_exact(&mut magic).await
                 .map_err(|e| DumperError::Format(format!("Failed to read stream magic: {}", e)))?;
             if &magic != STREAM_MAGIC {
                 return Err(DumperError::Format(format!(
@@ -34,6 +37,7 @@ impl<R: Read> StreamDecoder<R> {
                     STREAM_MAGIC, magic
                 )));
             }
+            self.stream_hasher.update(STREAM_MAGIC);
             self.bytes_read += 4;
             self.magic_checked = true;
         }
@@ -41,16 +45,16 @@ impl<R: Read> StreamDecoder<R> {
     }
 
     /// Read next record from the stream. Returns `None` at EOF or after Trailer.
-    pub fn read_next_record(&mut self) -> Result<Option<StreamRecord>, DumperError> {
+    pub async fn read_next_record(&mut self) -> Result<Option<StreamRecord>, DumperError> {
         if self.reached_eof {
             return Ok(None);
         }
 
-        self.check_magic()?;
+        self.check_magic().await?;
 
         let mut header = [0u8; 6]; // type (1B) + flags (1B) + len (4B)
-        match self.reader.read_exact(&mut header) {
-            Ok(()) => {}
+        match self.reader.read_exact(&mut header).await {
+            Ok(_) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 self.reached_eof = true;
                 return Ok(None);
@@ -60,10 +64,11 @@ impl<R: Read> StreamDecoder<R> {
 
         let type_byte = header[0];
         let flags = header[1];
-        let payload_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+        let len_bytes = [header[2], header[3], header[4], header[5]];
+        let payload_len = u32::from_le_bytes(len_bytes) as usize;
 
         // Bounded payload limit to prevent malicious memory allocation
-        const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+        const MAX_PAYLOAD_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
         if payload_len > MAX_PAYLOAD_SIZE {
             return Err(DumperError::Integrity(format!(
                 "Payload size {} exceeds maximum allowed frame limit",
@@ -72,16 +77,16 @@ impl<R: Read> StreamDecoder<R> {
         }
 
         let mut payload = vec![0u8; payload_len];
-        self.reader.read_exact(&mut payload)?;
+        self.reader.read_exact(&mut payload).await?;
 
         let mut crc_bytes = [0u8; 4];
-        self.reader.read_exact(&mut crc_bytes)?;
+        self.reader.read_exact(&mut crc_bytes).await?;
         let expected_crc = u32::from_le_bytes(crc_bytes);
 
         // Verify CRC
         let mut crc_hasher = CrcHasher::new();
         crc_hasher.update(&[type_byte, flags]);
-        crc_hasher.update(&header[2..6]);
+        crc_hasher.update(&len_bytes);
         crc_hasher.update(&payload);
         let calculated_crc = crc_hasher.finalize();
 
@@ -97,6 +102,17 @@ impl<R: Read> StreamDecoder<R> {
 
         let record_type = RecordType::try_from(type_byte)
             .map_err(|b| DumperError::Format(format!("Unknown record type 0x{:02x}", b)))?;
+
+        let pre_trailer_hash = if record_type == RecordType::Trailer {
+            Some(hex::encode(self.stream_hasher.clone().finalize()))
+        } else {
+            None
+        };
+
+        self.stream_hasher.update([type_byte, flags]);
+        self.stream_hasher.update(len_bytes);
+        self.stream_hasher.update(&payload);
+        self.stream_hasher.update(crc_bytes);
 
         let record = match record_type {
             RecordType::Header => {
@@ -129,6 +145,13 @@ impl<R: Read> StreamDecoder<R> {
             }
             RecordType::Trailer => {
                 let t: StreamTrailer = serde_json::from_slice(&payload)?;
+                let expected_hash = pre_trailer_hash.unwrap();
+                if expected_hash != t.stream_hash_hex {
+                    return Err(DumperError::Integrity(format!(
+                        "Stream SHA-256 hash mismatch: expected {}, calculated {}",
+                        t.stream_hash_hex, expected_hash
+                    )));
+                }
                 self.reached_eof = true;
                 StreamRecord::Trailer(t)
             }
@@ -151,8 +174,8 @@ mod tests {
     use super::*;
     use crate::stream::encoder::StreamEncoder;
 
-    #[test]
-    fn test_stream_encode_decode_roundtrip() {
+    #[tokio::test]
+    async fn test_stream_encode_decode_roundtrip() {
         let mut buffer = Vec::new();
         {
             let mut encoder = StreamEncoder::new(&mut buffer);
@@ -165,7 +188,7 @@ mod tests {
                 dumper_version: "0.1.0".into(),
                 start_time: 1700000000,
             };
-            encoder.write_record(&StreamRecord::Header(header)).unwrap();
+            encoder.write_record(&StreamRecord::Header(header)).await.unwrap();
 
             let schema = TableSchemaRecord {
                 schema_name: "public".into(),
@@ -178,7 +201,7 @@ mod tests {
                 }],
                 create_sql: "CREATE TABLE public.users (id integer NOT NULL);".into(),
             };
-            encoder.write_record(&StreamRecord::TableSchema(schema)).unwrap();
+            encoder.write_record(&StreamRecord::TableSchema(schema)).await.unwrap();
 
             let data_slice = TableDataSliceRecord {
                 schema_name: "public".into(),
@@ -187,14 +210,14 @@ mod tests {
                 is_last: true,
                 data: vec![1, 2, 3, 4, 5, 6, 7, 8],
             };
-            encoder.write_record(&StreamRecord::TableDataSlice(data_slice)).unwrap();
+            encoder.write_record(&StreamRecord::TableDataSlice(data_slice)).await.unwrap();
 
-            encoder.finish().unwrap();
+            encoder.finish().await.unwrap();
         }
 
         // Now decode
         let mut decoder = StreamDecoder::new(&buffer[..]);
-        let r1 = decoder.read_next_record().unwrap().unwrap();
+        let r1 = decoder.read_next_record().await.unwrap().unwrap();
         match r1 {
             StreamRecord::Header(h) => {
                 assert_eq!(h.database, "production_app");
@@ -203,7 +226,7 @@ mod tests {
             _ => panic!("Expected Header"),
         }
 
-        let r2 = decoder.read_next_record().unwrap().unwrap();
+        let r2 = decoder.read_next_record().await.unwrap().unwrap();
         match r2 {
             StreamRecord::TableSchema(s) => {
                 assert_eq!(s.table_name, "users");
@@ -211,7 +234,7 @@ mod tests {
             _ => panic!("Expected TableSchema"),
         }
 
-        let r3 = decoder.read_next_record().unwrap().unwrap();
+        let r3 = decoder.read_next_record().await.unwrap().unwrap();
         match r3 {
             StreamRecord::TableDataSlice(d) => {
                 assert_eq!(d.data, vec![1, 2, 3, 4, 5, 6, 7, 8]);
@@ -220,7 +243,7 @@ mod tests {
             _ => panic!("Expected TableDataSlice"),
         }
 
-        let r4 = decoder.read_next_record().unwrap().unwrap();
+        let r4 = decoder.read_next_record().await.unwrap().unwrap();
         match r4 {
             StreamRecord::Trailer(t) => {
                 assert_eq!(t.total_records, 3); // Header, Schema, Data
@@ -229,7 +252,7 @@ mod tests {
             _ => panic!("Expected Trailer"),
         }
 
-        let r5 = decoder.read_next_record().unwrap();
+        let r5 = decoder.read_next_record().await.unwrap();
         assert!(r5.is_none());
     }
 }

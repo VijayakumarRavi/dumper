@@ -1,4 +1,4 @@
-use std::io::Write;
+use tokio::io::{AsyncWrite, AsyncRead};
 use crate::error::DumperError;
 use crate::stream::decoder::StreamDecoder;
 use crate::stream::encoder::StreamEncoder;
@@ -35,12 +35,12 @@ pub struct RestoreStats {
 pub trait DatabaseAdapter: Send + Sync {
     fn inspect(&self) -> impl std::future::Future<Output = Result<DatabaseMeta, DumperError>> + Send;
 
-    fn backup<W: Write + Send>(
+    fn backup<W: AsyncWrite + Unpin + Send>(
         &self,
         encoder: &mut StreamEncoder<W>,
     ) -> impl std::future::Future<Output = Result<BackupStats, DumperError>> + Send;
 
-    fn restore<R: std::io::Read + Send>(
+    fn restore<R: AsyncRead + Unpin + Send>(
         &self,
         decoder: &mut StreamDecoder<R>,
         options: &RestoreOptions,
@@ -73,7 +73,7 @@ impl AnyDatabaseAdapter {
         }
     }
 
-    pub async fn backup<W: Write + Send>(
+    pub async fn backup<W: AsyncWrite + Unpin + Send>(
         &self,
         encoder: &mut StreamEncoder<W>,
     ) -> Result<BackupStats, DumperError> {
@@ -83,7 +83,7 @@ impl AnyDatabaseAdapter {
         }
     }
 
-    pub async fn restore<R: std::io::Read + Send>(
+    pub async fn restore<R: AsyncRead + Unpin + Send>(
         &self,
         decoder: &mut StreamDecoder<R>,
         options: &RestoreOptions,

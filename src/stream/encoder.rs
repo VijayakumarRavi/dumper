@@ -1,10 +1,10 @@
-use std::io::Write;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crc32fast::Hasher as CrcHasher;
 use sha2::{Digest, Sha256};
 use crate::error::DumperError;
 use crate::stream::format::*;
 
-pub struct StreamEncoder<W: Write> {
+pub struct StreamEncoder<W: AsyncWrite + Unpin + Send> {
     writer: W,
     record_count: u64,
     total_bytes_written: u64,
@@ -12,7 +12,7 @@ pub struct StreamEncoder<W: Write> {
     magic_written: bool,
 }
 
-impl<W: Write> StreamEncoder<W> {
+impl<W: AsyncWrite + Unpin + Send> StreamEncoder<W> {
     pub fn new(writer: W) -> Self {
         Self {
             writer,
@@ -23,9 +23,9 @@ impl<W: Write> StreamEncoder<W> {
         }
     }
 
-    fn ensure_magic(&mut self) -> Result<(), DumperError> {
+    async fn ensure_magic(&mut self) -> Result<(), DumperError> {
         if !self.magic_written {
-            self.writer.write_all(STREAM_MAGIC)?;
+            self.writer.write_all(STREAM_MAGIC).await?;
             self.hasher.update(STREAM_MAGIC);
             self.total_bytes_written += STREAM_MAGIC.len() as u64;
             self.magic_written = true;
@@ -33,8 +33,8 @@ impl<W: Write> StreamEncoder<W> {
         Ok(())
     }
 
-    pub fn write_raw_record(&mut self, record_type: RecordType, flags: u8, payload: &[u8]) -> Result<(), DumperError> {
-        self.ensure_magic()?;
+    pub async fn write_raw_record(&mut self, record_type: RecordType, flags: u8, payload: &[u8]) -> Result<(), DumperError> {
+        self.ensure_magic().await?;
 
         let mut crc_hasher = CrcHasher::new();
         let type_byte = record_type as u8;
@@ -46,10 +46,10 @@ impl<W: Write> StreamEncoder<W> {
         let crc = crc_hasher.finalize();
 
         // Write header
-        self.writer.write_all(&[type_byte, flags])?;
-        self.writer.write_all(&len_bytes)?;
-        self.writer.write_all(payload)?;
-        self.writer.write_all(&crc.to_le_bytes())?;
+        self.writer.write_all(&[type_byte, flags]).await?;
+        self.writer.write_all(&len_bytes).await?;
+        self.writer.write_all(payload).await?;
+        self.writer.write_all(&crc.to_le_bytes()).await?;
 
         // Update stream SHA-256
         self.hasher.update([type_byte, flags]);
@@ -64,52 +64,52 @@ impl<W: Write> StreamEncoder<W> {
         Ok(())
     }
 
-    pub fn write_record(&mut self, record: &StreamRecord) -> Result<(), DumperError> {
+    pub async fn write_record(&mut self, record: &StreamRecord) -> Result<(), DumperError> {
         match record {
             StreamRecord::Header(h) => {
                 let payload = serde_json::to_vec(h)?;
-                self.write_raw_record(RecordType::Header, 0, &payload)
+                self.write_raw_record(RecordType::Header, 0, &payload).await
             }
             StreamRecord::PreData(p) => {
                 let payload = serde_json::to_vec(p)?;
-                self.write_raw_record(RecordType::PreData, 0, &payload)
+                self.write_raw_record(RecordType::PreData, 0, &payload).await
             }
             StreamRecord::TableSchema(s) => {
                 let payload = serde_json::to_vec(s)?;
-                self.write_raw_record(RecordType::TableSchema, 0, &payload)
+                self.write_raw_record(RecordType::TableSchema, 0, &payload).await
             }
             StreamRecord::TableDataSlice(d) => {
                 let payload = serde_json::to_vec(d)?;
-                self.write_raw_record(RecordType::TableDataSlice, 0, &payload)
+                self.write_raw_record(RecordType::TableDataSlice, 0, &payload).await
             }
             StreamRecord::Sequence(s) => {
                 let payload = serde_json::to_vec(s)?;
-                self.write_raw_record(RecordType::Sequence, 0, &payload)
+                self.write_raw_record(RecordType::Sequence, 0, &payload).await
             }
             StreamRecord::PostData(p) => {
                 let payload = serde_json::to_vec(p)?;
-                self.write_raw_record(RecordType::PostData, 0, &payload)
+                self.write_raw_record(RecordType::PostData, 0, &payload).await
             }
             StreamRecord::Routine(r) => {
                 let payload = serde_json::to_vec(r)?;
-                self.write_raw_record(RecordType::Routine, 0, &payload)
+                self.write_raw_record(RecordType::Routine, 0, &payload).await
             }
             StreamRecord::Trailer(t) => {
                 let payload = serde_json::to_vec(t)?;
-                self.write_raw_record(RecordType::Trailer, 0, &payload)
+                self.write_raw_record(RecordType::Trailer, 0, &payload).await
             }
         }
     }
 
-    pub fn finish(mut self) -> Result<(u64, String), DumperError> {
+    pub async fn finish(mut self) -> Result<(u64, String), DumperError> {
         let hash_hex = hex::encode(self.hasher.clone().finalize());
         let trailer = StreamTrailer {
             total_records: self.record_count,
             total_logical_bytes: self.total_bytes_written,
             stream_hash_hex: hash_hex.clone(),
         };
-        self.write_record(&StreamRecord::Trailer(trailer))?;
-        self.writer.flush()?;
+        self.write_record(&StreamRecord::Trailer(trailer)).await?;
+        self.writer.flush().await?;
         Ok((self.total_bytes_written, hash_hex))
     }
 

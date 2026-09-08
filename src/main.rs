@@ -144,32 +144,68 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
             let snapshot_short_id = hex::encode(rand::random::<[u8; 4]>());
             let full_id = hex::encode(rand::random::<[u8; 16]>());
 
-            let mut stored_blobs: Vec<BlobReference> = Vec::new();
-            let mut total_stored_bytes = 0u64;
-            let mut total_dedup_bytes = 0u64;
-
-            // Piping streaming encoder -> chunker -> repository
+            // Piping streaming encoder -> chunker -> repository using bounded pipe
             let compression_level = cli.compression;
-            let mut intermediate_buffer = Vec::new();
-            let mut encoder = StreamEncoder::new(&mut intermediate_buffer);
+            let chunk_size = 2 * 1024 * 1024; // 2 MiB
+            let (mut reader, writer) = tokio::io::duplex(chunk_size);
+            let mut encoder = StreamEncoder::new(writer);
+
+            // Spawn background task to chunk and upload the stream
+            let engine_clone = engine.clone();
+            let upload_handle = tokio::spawn(async move {
+                let mut stored_blobs = Vec::new();
+                let mut total_stored_bytes = 0u64;
+                let mut total_dedup_bytes = 0u64;
+                
+                let mut buffer = vec![0u8; chunk_size];
+                let mut chunk_bytes_read = 0;
+                
+                use tokio::io::AsyncReadExt;
+                loop {
+                    let mut remaining = chunk_size - chunk_bytes_read;
+                    if remaining == 0 {
+                        let hash_bytes = sha2::Sha256::digest(&buffer);
+                        let hash_hex = hex::encode(hash_bytes);
+                        let (blob_ref, was_dedup) = engine_clone.put_chunk(&buffer, &hash_hex, compression_level).await?;
+                        
+                        if was_dedup {
+                            total_dedup_bytes += blob_ref.raw_size;
+                        } else {
+                            total_stored_bytes += blob_ref.stored_size;
+                        }
+                        stored_blobs.push(blob_ref);
+                        
+                        chunk_bytes_read = 0;
+                        remaining = chunk_size;
+                    }
+                    
+                    let n = reader.read(&mut buffer[chunk_bytes_read..]).await.map_err(|e| DumperError::Io(e))?;
+                    if n == 0 {
+                        if chunk_bytes_read > 0 {
+                            let final_slice = &buffer[..chunk_bytes_read];
+                            let hash_bytes = sha2::Sha256::digest(final_slice);
+                            let hash_hex = hex::encode(hash_bytes);
+                            let (blob_ref, was_dedup) = engine_clone.put_chunk(final_slice, &hash_hex, compression_level).await?;
+                            
+                            if was_dedup {
+                                total_dedup_bytes += blob_ref.raw_size;
+                            } else {
+                                total_stored_bytes += blob_ref.stored_size;
+                            }
+                            stored_blobs.push(blob_ref);
+                        }
+                        break;
+                    }
+                    chunk_bytes_read += n;
+                }
+                
+                Ok::<_, DumperError>((stored_blobs, total_stored_bytes, total_dedup_bytes))
+            });
 
             let backup_stats = db_adapter.backup(&mut encoder).await?;
-            let (logical_bytes, _) = encoder.finish()?;
+            let (logical_bytes, _) = encoder.finish().await?;
 
-            // Chunk and upload with bounded chunker
-            let chunk_size = 2 * 1024 * 1024; // 2 MiB
-            for chunk_slice in intermediate_buffer.chunks(chunk_size) {
-                let hash_bytes = sha2::Sha256::digest(chunk_slice);
-                let hash_hex = hex::encode(hash_bytes);
-                let (blob_ref, was_dedup) = engine.put_chunk(chunk_slice, &hash_hex, compression_level).await?;
-
-                if was_dedup {
-                    total_dedup_bytes += blob_ref.raw_size;
-                } else {
-                    total_stored_bytes += blob_ref.stored_size;
-                }
-                stored_blobs.push(blob_ref);
-            }
+            let (stored_blobs, total_stored_bytes, total_dedup_bytes) = upload_handle.await.map_err(|e| DumperError::Repository(format!("Upload task panicked: {}", e)))??;
 
             let completed_time = chrono::Utc::now();
             let duration_seconds = (completed_time - start_time).num_seconds().max(0) as u64;
@@ -288,21 +324,29 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
 
             let db_adapter = AnyDatabaseAdapter::from_url(&args.target)?;
 
-            // Stream reconstruct all chunks into a unified reader
-            let mut reconstructed_stream = Vec::new();
-            for (i, blob_ref) in snapshot.blobs.iter().enumerate() {
-                reporter.log_info(&format!("Fetching chunk {}/{} ({})", i + 1, snapshot.blobs.len(), blob_ref.hash));
-                let chunk_bytes = engine.get_chunk(&blob_ref.hash).await?;
-                reconstructed_stream.extend_from_slice(&chunk_bytes);
-            }
+            let chunk_size = 2 * 1024 * 1024; // 2 MiB
+            let (reader, mut writer) = tokio::io::duplex(chunk_size);
+            
+            let engine_clone = engine.clone();
+            let blobs = snapshot.blobs.clone();
+            
+            let download_handle = tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                for blob_ref in blobs.iter() {
+                    let chunk_bytes = engine_clone.get_chunk(&blob_ref.hash).await?;
+                    writer.write_all(&chunk_bytes).await.map_err(|e| DumperError::Io(e))?;
+                }
+                Ok::<_, DumperError>(())
+            });
 
-            let mut decoder = StreamDecoder::new(&reconstructed_stream[..]);
+            let mut decoder = StreamDecoder::new(reader);
             let options = RestoreOptions {
                 target_database_override: args.database.clone(),
                 drop_existing: args.drop_existing,
             };
 
             let stats = db_adapter.restore(&mut decoder, &options).await?;
+            download_handle.await.map_err(|e| DumperError::Repository(format!("Download task panicked: {}", e)))??;
             lock.release(&*backend).await?;
 
             reporter.log_info(&format!(
@@ -321,16 +365,29 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
 
             if args.restore_test {
                 reporter.log_info("Running stream reconstruction test...");
-                let mut stream_bytes = Vec::new();
-                for b in &snapshot.blobs {
-                    let chunk = engine.get_chunk(&b.hash).await?;
-                    stream_bytes.extend_from_slice(&chunk);
-                }
-                let mut decoder = StreamDecoder::new(&stream_bytes[..]);
+                
+                let chunk_size = 2 * 1024 * 1024; // 2 MiB
+                let (reader, mut writer) = tokio::io::duplex(chunk_size);
+                
+                let engine_clone = engine.clone();
+                let blobs = snapshot.blobs.clone();
+                
+                let download_handle = tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    for b in &blobs {
+                        let chunk = engine_clone.get_chunk(&b.hash).await?;
+                        writer.write_all(&chunk).await.map_err(|e| DumperError::Io(e))?;
+                    }
+                    Ok::<_, DumperError>(())
+                });
+                
+                let mut decoder = StreamDecoder::new(reader);
                 let mut records_seen = 0u64;
-                while let Some(_rec) = decoder.read_next_record()? {
+                while let Some(_rec) = decoder.read_next_record().await? {
                     records_seen += 1;
                 }
+                
+                download_handle.await.map_err(|e| DumperError::Repository(format!("Download task panicked: {}", e)))??;
                 reporter.log_info(&format!("Stream test passed: {} records decoded with verified CRC32", records_seen));
             }
 
