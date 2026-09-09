@@ -49,6 +49,83 @@ impl TestPgServer {
         Some(Self { dir, port })
     }
 
+    fn start_with_ssl() -> Option<Self> {
+        let dir = TempDir::new().ok()?;
+        let path = dir.path().to_str()?;
+        let offset = PG_PORT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = 54300 + ((std::process::id() as u16 % 200) * 10) + offset;
+
+        let init_status = Command::new("initdb")
+            .args(["-D", path, "--no-sync", "-A", "trust", "-U", "postgres"])
+            .output()
+            .ok()?;
+        if !init_status.status.success() {
+            return None;
+        }
+
+        // Generate self-signed cert and key
+        let openssl_status = Command::new("openssl")
+            .args([
+                "req",
+                "-new",
+                "-x509",
+                "-days",
+                "1",
+                "-nodes",
+                "-out",
+                &format!("{}/server.crt", path),
+                "-keyout",
+                &format!("{}/server.key", path),
+                "-subj",
+                "/CN=127.0.0.1",
+            ])
+            .output()
+            .ok()?;
+        if !openssl_status.status.success() {
+            return None;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                format!("{}/server.key", path),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+
+        let ssl_conf = format!(
+            "\nssl = on\nssl_cert_file = '{}/server.crt'\nssl_key_file = '{}/server.key'\n",
+            path, path
+        );
+        use std::io::Write;
+        let mut conf_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(format!("{}/postgresql.conf", path))
+            .ok()?;
+        conf_file.write_all(ssl_conf.as_bytes()).ok()?;
+
+        let log_file = format!("{}/pg.log", path);
+        let start_status = Command::new("pg_ctl")
+            .args([
+                "-D",
+                path,
+                "-l",
+                &log_file,
+                "-o",
+                &format!("-p {}", port),
+                "-w",
+                "start",
+            ])
+            .output()
+            .ok()?;
+        if !start_status.status.success() {
+            return None;
+        }
+
+        Some(Self { dir, port })
+    }
+
     fn url(&self) -> String {
         format!("postgres://postgres@127.0.0.1:{}/postgres", self.port)
     }
@@ -534,5 +611,212 @@ async fn test_postgres_tls_rejection_on_sslmode_require() {
     assert!(
         prefer_adapter.inspect().await.is_ok(),
         "sslmode=prefer must succeed on non-SSL server"
+    );
+}
+
+#[tokio::test]
+async fn test_postgres_tls_success_roundtrip() {
+    let pg = match TestPgServer::start_with_ssl() {
+        Some(server) => server,
+        None => {
+            eprintln!("PostgreSQL with SSL not available or failed to start, skipping test.");
+            return;
+        }
+    };
+
+    // 1. Verify that sslmode=require succeeds on SSL-enabled server
+    let target_db = "postgres_tls_test";
+    assert!(pg.createdb(target_db));
+
+    let db_tls_url = format!(
+        "postgres://postgres@127.0.0.1:{}/{}?sslmode=require",
+        pg.port, target_db
+    );
+    let target_adapter = PostgresAdapter::new(&db_tls_url);
+
+    let stats_inspect = target_adapter.inspect().await.unwrap();
+    assert_eq!(stats_inspect.database, target_db);
+
+    // Create table and insert rows using setup client
+    let setup_url = format!(
+        "postgres://postgres@127.0.0.1:{}/{}?sslmode=disable",
+        pg.port, target_db
+    );
+    {
+        let (client, conn) = tokio_postgres::connect(&setup_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .batch_execute(
+                "
+            CREATE TABLE tls_data (id int PRIMARY KEY, note text);
+            INSERT INTO tls_data VALUES (1, 'secure data'), (2, 'encrypted row');
+        ",
+            )
+            .await
+            .unwrap();
+    }
+
+    // Backup via TLS (sslmode=require)
+    let mut backup_buf = Vec::new();
+    {
+        let mut encoder = StreamEncoder::new(&mut backup_buf);
+        let backup_stats = target_adapter.backup(&mut encoder).await.unwrap();
+        assert_eq!(backup_stats.tables_backed_up, 1);
+        encoder.finish().await.unwrap();
+    }
+
+    // Drop table
+    {
+        let (client, conn) = tokio_postgres::connect(&setup_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client.batch_execute("DROP TABLE tls_data;").await.unwrap();
+    }
+
+    // Restore via TLS (sslmode=require)
+    {
+        let mut decoder = StreamDecoder::new(&backup_buf[..]);
+        let restore_opts = RestoreOptions {
+            target_database_override: None,
+            drop_existing: false,
+        };
+        let restore_stats = target_adapter
+            .restore(&mut decoder, &restore_opts)
+            .await
+            .unwrap();
+        assert_eq!(restore_stats.tables_restored, 1);
+    }
+
+    // 2. sslmode=verify-full must fail because self-signed certificate is not in WebPKI CA roots
+    let verify_url = format!(
+        "postgres://postgres@127.0.0.1:{}/{}?sslmode=verify-full",
+        pg.port, target_db
+    );
+    let verify_adapter = PostgresAdapter::new(&verify_url);
+    let res = verify_adapter.inspect().await;
+    assert!(
+        res.is_err(),
+        "sslmode=verify-full must reject self-signed certificate"
+    );
+}
+
+#[tokio::test]
+async fn test_postgres_concurrent_write_consistency() {
+    let pg = match TestPgServer::start() {
+        Some(server) => server,
+        None => return,
+    };
+
+    let target_db = "concurrent_tx_db";
+    assert!(pg.createdb(target_db));
+    let db_url = format!("postgres://postgres@127.0.0.1:{}/{}", pg.port, target_db);
+    let adapter = PostgresAdapter::new(&db_url);
+
+    // Create table and insert initial batch
+    {
+        let (client, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .batch_execute(
+                "
+            CREATE TABLE accounts (id int PRIMARY KEY, balance numeric(10, 2));
+            INSERT INTO accounts (id, balance) SELECT g, 100.00 FROM generate_series(1, 100) g;
+        ",
+            )
+            .await
+            .unwrap();
+    }
+
+    // Spawn a concurrent writer task that updates and inserts rows continuously
+    let stop_writer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop_writer.clone();
+    let write_url = db_url.clone();
+    let writer_handle = tokio::spawn(async move {
+        let (client, conn) = tokio_postgres::connect(&write_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let mut i = 101;
+        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = client
+                .execute(
+                    "INSERT INTO accounts (id, balance) VALUES ($1, 50.00) ON CONFLICT (id) DO NOTHING",
+                    &[&i],
+                )
+                .await;
+            let _ = client
+                .execute(
+                    "UPDATE accounts SET balance = balance + 1.00 WHERE id = 1",
+                    &[],
+                )
+                .await;
+            i += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    });
+
+    // Run backup while concurrent writes are occurring
+    let mut backup_buf = Vec::new();
+    let backup_stats = {
+        let mut encoder = StreamEncoder::new(&mut backup_buf);
+        let stats = adapter.backup(&mut encoder).await.unwrap();
+        encoder.finish().await.unwrap();
+        stats
+    };
+
+    // Stop writer
+    stop_writer.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = writer_handle.await;
+
+    assert_eq!(backup_stats.tables_backed_up, 1);
+
+    // Restore into a fresh database to verify consistency
+    let restore_db = "restored_tx_db";
+    assert!(pg.createdb(restore_db));
+    let restore_url = format!("postgres://postgres@127.0.0.1:{}/{}", pg.port, restore_db);
+    let restore_adapter = PostgresAdapter::new(&restore_url);
+
+    let mut decoder = StreamDecoder::new(&backup_buf[..]);
+    let restore_stats = restore_adapter
+        .restore(
+            &mut decoder,
+            &RestoreOptions {
+                target_database_override: None,
+                drop_existing: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(restore_stats.tables_restored, 1);
+
+    // Verify row integrity in restored database
+    let (client, conn) = tokio_postgres::connect(&restore_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let count_row = client
+        .query_one("SELECT count(*) FROM accounts", &[])
+        .await
+        .unwrap();
+    let count: i64 = count_row.get(0);
+    assert!(
+        count >= 100,
+        "Must have restored at least initial 100 rows: {}",
+        count
     );
 }

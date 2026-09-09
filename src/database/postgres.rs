@@ -14,16 +14,76 @@ pub struct PostgresAdapter {
     url: String,
 }
 
-fn create_rustls_connector() -> MakeRustlsConnect {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+#[derive(Debug)]
+struct NoCertificateVerification(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn create_rustls_connector(verify: bool) -> MakeRustlsConnect {
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    let client_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("valid TLS protocol versions")
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    MakeRustlsConnect::new(client_config)
+    if verify {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("valid TLS protocol versions")
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        MakeRustlsConnect::new(client_config)
+    } else {
+        let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("valid TLS protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification(
+                provider,
+            )))
+            .with_no_client_auth();
+        MakeRustlsConnect::new(client_config)
+    }
 }
 
 impl PostgresAdapter {
@@ -57,7 +117,10 @@ impl PostgresAdapter {
             });
             client
         } else {
-            let tls = create_rustls_connector();
+            let lower_url = self.url.to_lowercase();
+            let verify = lower_url.contains("sslmode=verify-ca")
+                || lower_url.contains("sslmode=verify-full");
+            let tls = create_rustls_connector(verify);
             match config.connect(tls).await {
                 Ok((client, connection)) => {
                     tokio::spawn(async move {
