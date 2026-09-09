@@ -338,8 +338,16 @@ impl StorageBackend for S3Client {
                 results.push(clean_key);
             }
 
+            let is_truncated = extract_xml_tags(&body, "IsTruncated")
+                .first()
+                .map(|s| s.trim().eq_ignore_ascii_case("true"));
+
+            if is_truncated == Some(false) {
+                break;
+            }
+
             let tokens = extract_xml_tags(&body, "NextContinuationToken");
-            if let Some(next) = tokens.into_iter().next() {
+            if let Some(next) = tokens.into_iter().next().filter(|t| !t.trim().is_empty()) {
                 continuation_token = Some(next);
             } else {
                 break;
@@ -351,21 +359,81 @@ impl StorageBackend for S3Client {
     }
 }
 
-fn extract_xml_tags(xml: &str, tag: &str) -> Vec<String> {
-    let open_tag = format!("<{}>", tag);
-    let close_tag = format!("</{}>", tag);
-    let mut results = Vec::new();
+fn unescape_xml(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
 
+fn extract_xml_tags(xml: &str, tag: &str) -> Vec<String> {
+    let mut results = Vec::new();
     let mut cursor = xml;
-    while let Some(start_pos) = cursor.find(&open_tag) {
-        let content_start = start_pos + open_tag.len();
-        let rest = &cursor[content_start..];
-        if let Some(end_pos) = rest.find(&close_tag) {
-            let val = &rest[..end_pos];
-            results.push(val.to_string());
-            cursor = &rest[end_pos + close_tag.len()..];
-        } else {
-            break;
+
+    let search_prefix = format!("<{}", tag);
+    let close_tag_start = format!("</{}", tag);
+
+    while let Some(start_pos) = cursor.find(&search_prefix) {
+        let after_start = &cursor[start_pos + search_prefix.len()..];
+        let next_char = after_start.chars().next();
+        match next_char {
+            Some('>') => {
+                // Exact tag: <tag>content</tag>
+                let content_start = &after_start[1..];
+                if let Some(close_pos) = content_start.find(&close_tag_start) {
+                    let content = &content_start[..close_pos];
+                    results.push(unescape_xml(content));
+                    let after_close = &content_start[close_pos + close_tag_start.len()..];
+                    if let Some(end_angle) = after_close.find('>') {
+                        cursor = &after_close[end_angle + 1..];
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            Some('/') => {
+                // Self-closing: <tag/>
+                if after_start.starts_with("/>") {
+                    results.push(String::new());
+                    cursor = &after_start[2..];
+                } else {
+                    cursor = after_start;
+                }
+            }
+            Some(c) if c.is_ascii_whitespace() => {
+                // Tag with attributes or namespaces: <tag attr="val">content</tag> or <tag attr="val" />
+                if let Some(open_end) = after_start.find('>') {
+                    let open_tag_content = &after_start[..open_end];
+                    if open_tag_content.trim_end().ends_with('/') {
+                        // Self-closing: <tag attr="val" />
+                        results.push(String::new());
+                        cursor = &after_start[open_end + 1..];
+                    } else {
+                        let content_start = &after_start[open_end + 1..];
+                        if let Some(close_pos) = content_start.find(&close_tag_start) {
+                            let content = &content_start[..close_pos];
+                            results.push(unescape_xml(content));
+                            let after_close = &content_start[close_pos + close_tag_start.len()..];
+                            if let Some(end_angle) = after_close.find('>') {
+                                cursor = &after_close[end_angle + 1..];
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            _ => {
+                // E.g. <Keyword> when searching for <Key> - skip past prefix
+                cursor = after_start;
+            }
         }
     }
 
@@ -394,6 +462,34 @@ mod tests {
         assert_eq!(keys, vec!["blobs/ab/1234", "blobs/cd/5678"]);
         let tokens = extract_xml_tags(xml, "NextContinuationToken");
         assert_eq!(tokens, vec!["token_xyz"]);
+    }
+
+    #[test]
+    fn test_extract_xml_with_attributes_namespaces_and_entities() {
+        let xml = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <Name>test-bucket</Name>
+            <IsTruncated>false</IsTruncated>
+            <Contents>
+                <Key xmlns="http://s3.amazonaws.com/doc/2006-03-01/">blobs/12/&lt;data&gt;&amp;test&apos;file&quot;.dmp</Key>
+                <Size>12345</Size>
+            </Contents>
+            <Contents>
+                <Key attr="sample">blobs/34/regular.dmp</Key>
+            </Contents>
+            <Keyword>ignore_me</Keyword>
+        </ListBucketResult>"#;
+
+        let keys = extract_xml_tags(xml, "Key");
+        assert_eq!(
+            keys,
+            vec!["blobs/12/<data>&test'file\".dmp", "blobs/34/regular.dmp"]
+        );
+
+        let truncated = extract_xml_tags(xml, "IsTruncated");
+        assert_eq!(truncated, vec!["false"]);
+
+        // Should NOT falsely match Keyword when searching for Key
+        assert_eq!(extract_xml_tags(xml, "Keyword"), vec!["ignore_me"]);
     }
 
     #[test]
