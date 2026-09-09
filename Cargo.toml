@@ -1,6 +1,6 @@
 [package]
 name = "dumper"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Dumper Maintainers"]
 description = "A tiny, production-grade database backup, restore, verification, retention, and repository-management CLI"
