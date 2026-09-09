@@ -1,18 +1,40 @@
-use tokio::io::{AsyncWrite, AsyncRead};
-use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, Pool};
 use crate::database::{BackupStats, DatabaseAdapter, DatabaseMeta, RestoreOptions, RestoreStats};
 use crate::error::DumperError;
 use crate::stream::decoder::StreamDecoder;
 use crate::stream::encoder::StreamEncoder;
 use crate::stream::format::*;
-use serde::{Serialize, Deserialize};
+use mysql_async::prelude::*;
+use mysql_async::{Conn, Opts, Pool};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
 
-#[derive(Serialize, Deserialize)]
-enum MysqlValue {
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum MysqlValue {
     Null,
     String(String),
     Bytes(Vec<u8>),
+}
+
+/// Escapes a string for safe inclusion in a MySQL string literal enclosed in single quotes.
+pub fn escape_mysql_string(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() + 2);
+    escaped.push('\'');
+    for c in s.chars() {
+        match c {
+            '\0' => escaped.push_str("\\0"),
+            '\'' => escaped.push_str("\\'"),
+            '\"' => escaped.push_str("\\\""),
+            '\x08' => escaped.push_str("\\b"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\x1A' => escaped.push_str("\\Z"),
+            '\\' => escaped.push_str("\\\\"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped.push('\'');
+    escaped
 }
 
 pub struct MysqlAdapter {
@@ -118,29 +140,41 @@ impl DatabaseAdapter for MysqlAdapter {
                 .unwrap_or_default();
 
             let cols_query = format!("SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = '{}' AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position", table);
-            let col_names: Vec<String> = conn.query_map(&cols_query, |c: String| c).await.unwrap_or_default();
-            let columns = col_names.iter().map(|c| TableColumnMeta {
-                name: c.clone(),
-                data_type: "".into(),
-                is_nullable: true,
-                default_val: None,
-            }).collect();
+            let col_names: Vec<String> = conn
+                .query_map(&cols_query, |c: String| c)
+                .await
+                .unwrap_or_default();
+            let columns = col_names
+                .iter()
+                .map(|c| TableColumnMeta {
+                    name: c.clone(),
+                    data_type: "".into(),
+                    is_nullable: true,
+                    default_val: None,
+                })
+                .collect();
 
-            encoder.write_record(&StreamRecord::TableSchema(TableSchemaRecord {
-                schema_name: db.clone(),
-                table_name: table.clone(),
-                columns,
-                create_sql,
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::TableSchema(TableSchemaRecord {
+                    schema_name: db.clone(),
+                    table_name: table.clone(),
+                    columns,
+                    create_sql,
+                }))
+                .await?;
 
             // Stream rows as chunked JSON/TSV data
             let select_query = if col_names.is_empty() {
                 format!("SELECT * FROM `{}`", table)
             } else {
-                let quoted_cols = col_names.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ");
+                let quoted_cols = col_names
+                    .iter()
+                    .map(|c| format!("`{}`", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("SELECT {} FROM `{}`", quoted_cols, table)
             };
-            
+
             let mut result_stream = conn
                 .query_iter(&select_query)
                 .await
@@ -194,13 +228,15 @@ impl DatabaseAdapter for MysqlAdapter {
                 if batch_rows.len() >= 1000 {
                     slice_seq += 1;
                     let data = serde_json::to_vec(&batch_rows)?;
-                    encoder.write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
-                        schema_name: db.clone(),
-                        table_name: table.clone(),
-                        slice_seq,
-                        is_last: false,
-                        data,
-                    })).await?;
+                    encoder
+                        .write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
+                            schema_name: db.clone(),
+                            table_name: table.clone(),
+                            slice_seq,
+                            is_last: false,
+                            data,
+                        }))
+                        .await?;
                     batch_rows.clear();
                 }
             }
@@ -209,23 +245,27 @@ impl DatabaseAdapter for MysqlAdapter {
             if !batch_rows.is_empty() {
                 slice_seq += 1;
                 let data = serde_json::to_vec(&batch_rows)?;
-                encoder.write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
-                    schema_name: db.clone(),
-                    table_name: table.clone(),
-                    slice_seq,
-                    is_last: false,
-                    data,
-                })).await?;
+                encoder
+                    .write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
+                        schema_name: db.clone(),
+                        table_name: table.clone(),
+                        slice_seq,
+                        is_last: false,
+                        data,
+                    }))
+                    .await?;
             }
 
             // End slice
-            encoder.write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
-                schema_name: db.clone(),
-                table_name: table.clone(),
-                slice_seq: slice_seq + 1,
-                is_last: true,
-                data: Vec::new(),
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
+                    schema_name: db.clone(),
+                    table_name: table.clone(),
+                    slice_seq: slice_seq + 1,
+                    is_last: true,
+                    data: Vec::new(),
+                }))
+                .await?;
 
             tables_backed_up += 1;
         }
@@ -242,12 +282,14 @@ impl DatabaseAdapter for MysqlAdapter {
 
         for (vname, vdef) in views {
             let sql = format!("CREATE OR REPLACE VIEW `{}` AS {};", vname, vdef);
-            encoder.write_record(&StreamRecord::Routine(RoutineRecord {
-                schema_name: meta.database.clone(),
-                name: vname,
-                routine_type: "VIEW".into(),
-                sql,
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::Routine(RoutineRecord {
+                    schema_name: meta.database.clone(),
+                    name: vname,
+                    routine_type: "VIEW".into(),
+                    sql,
+                }))
+                .await?;
         }
 
         // 4. Triggers
@@ -258,25 +300,31 @@ impl DatabaseAdapter for MysqlAdapter {
                 let timing: String = row.take("Timing").unwrap();
                 let event: String = row.take("Event").unwrap();
                 let table: String = row.take("Table").unwrap();
-                format!("CREATE TRIGGER `{}` {} {} ON `{}` FOR EACH ROW {}", trigger, timing, event, table, stmt)
+                format!(
+                    "CREATE TRIGGER `{}` {} {} ON `{}` FOR EACH ROW {}",
+                    trigger, timing, event, table, stmt
+                )
             })
             .await
             .unwrap_or_default();
-            
+
         for trig in triggers {
-            encoder.write_record(&StreamRecord::PostData(PostDataRecord {
-                schema_name: meta.database.clone(),
-                table_name: "".into(),
-                name: "".into(),
-                sql: format!("{};", trig),
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::PostData(PostDataRecord {
+                    schema_name: meta.database.clone(),
+                    table_name: "".into(),
+                    name: "".into(),
+                    sql: format!("{};", trig),
+                }))
+                .await?;
         }
 
         // 5. Routines (Procedures and Functions)
         let procs: Vec<String> = conn
-            .query_map("SHOW PROCEDURE STATUS WHERE Db = DATABASE()", |mut row: mysql_async::Row| {
-                row.take("Name").unwrap()
-            })
+            .query_map(
+                "SHOW PROCEDURE STATUS WHERE Db = DATABASE()",
+                |mut row: mysql_async::Row| row.take("Name").unwrap(),
+            )
             .await
             .unwrap_or_default();
 
@@ -285,20 +333,23 @@ impl DatabaseAdapter for MysqlAdapter {
             if let Ok(Some(mut row)) = conn.query_first::<mysql_async::Row, _>(&q).await {
                 if let Some(def) = row.take("Create Procedure") {
                     let def: String = def;
-                    encoder.write_record(&StreamRecord::Routine(RoutineRecord {
-                        schema_name: meta.database.clone(),
-                        name: p.clone(),
-                        routine_type: "PROCEDURE".into(),
-                        sql: format!("{};", def),
-                    })).await?;
+                    encoder
+                        .write_record(&StreamRecord::Routine(RoutineRecord {
+                            schema_name: meta.database.clone(),
+                            name: p.clone(),
+                            routine_type: "PROCEDURE".into(),
+                            sql: format!("{};", def),
+                        }))
+                        .await?;
                 }
             }
         }
 
         let funcs: Vec<String> = conn
-            .query_map("SHOW FUNCTION STATUS WHERE Db = DATABASE()", |mut row: mysql_async::Row| {
-                row.take("Name").unwrap()
-            })
+            .query_map(
+                "SHOW FUNCTION STATUS WHERE Db = DATABASE()",
+                |mut row: mysql_async::Row| row.take("Name").unwrap(),
+            )
             .await
             .unwrap_or_default();
 
@@ -307,12 +358,14 @@ impl DatabaseAdapter for MysqlAdapter {
             if let Ok(Some(mut row)) = conn.query_first::<mysql_async::Row, _>(&q).await {
                 if let Some(def) = row.take("Create Function") {
                     let def: String = def;
-                    encoder.write_record(&StreamRecord::Routine(RoutineRecord {
-                        schema_name: meta.database.clone(),
-                        name: f.clone(),
-                        routine_type: "FUNCTION".into(),
-                        sql: format!("{};", def),
-                    })).await?;
+                    encoder
+                        .write_record(&StreamRecord::Routine(RoutineRecord {
+                            schema_name: meta.database.clone(),
+                            name: f.clone(),
+                            routine_type: "FUNCTION".into(),
+                            sql: format!("{};", def),
+                        }))
+                        .await?;
                 }
             }
         }
@@ -343,6 +396,8 @@ impl DatabaseAdapter for MysqlAdapter {
 
         let mut tables_restored = 0;
         let mut records_processed = 0u64;
+        let mut table_columns_cache: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         while let Some(record) = decoder.read_next_record().await? {
             records_processed += 1;
@@ -361,44 +416,89 @@ impl DatabaseAdapter for MysqlAdapter {
                         let _ = conn.query_drop(&drop_sql).await;
                     }
                     conn.query_drop(&s.create_sql).await.map_err(|e| {
-                        DumperError::Restore(format!("Failed to create table {}: {}", s.table_name, e))
+                        DumperError::Restore(format!(
+                            "Failed to create table {}: {}",
+                            s.table_name, e
+                        ))
                     })?;
+
+                    table_columns_cache.remove(&s.table_name);
+                    if !s.columns.is_empty() {
+                        let col_names = s
+                            .columns
+                            .iter()
+                            .map(|c| format!("`{}`", c.name))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        table_columns_cache.insert(s.table_name.clone(), col_names);
+                    }
+
                     tables_restored += 1;
                 }
                 StreamRecord::TableDataSlice(d) => {
                     if !d.data.is_empty() {
                         let batch_rows: Vec<Vec<MysqlValue>> = serde_json::from_slice(&d.data)?;
-                        
-                        // We must fetch the schema from a cache if we want columns, but since TableSchema precedes TableDataSlice,
-                        // we can query the target database for columns, OR we can just use the schema record if we cache it.
-                        // For simplicity, we just rely on `INSERT INTO table VALUES` unless we need to query columns.
-                        // Actually, if we just query the table columns now:
-                        let cols_query = format!("SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = '{}' AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position", d.table_name);
-                        let col_names: Vec<String> = conn.query_map(&cols_query, |c: String| format!("`{}`", c)).await.unwrap_or_default();
-                        
+
+                        let col_names = match table_columns_cache.get(&d.table_name) {
+                            Some(cols) => cols.clone(),
+                            None => {
+                                let cols_query = format!(
+                                    "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = '{}' AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position",
+                                    d.table_name
+                                );
+                                let cols: Vec<String> = conn
+                                    .query_map(&cols_query, |c: String| format!("`{}`", c))
+                                    .await
+                                    .unwrap_or_default();
+                                let cols_str = cols.join(", ");
+                                table_columns_cache.insert(d.table_name.clone(), cols_str.clone());
+                                cols_str
+                            }
+                        };
+
                         let insert_prefix = if col_names.is_empty() {
                             format!("INSERT INTO `{}` VALUES", d.table_name)
                         } else {
-                            format!("INSERT INTO `{}` ({}) VALUES", d.table_name, col_names.join(", "))
+                            format!("INSERT INTO `{}` ({}) VALUES", d.table_name, col_names)
                         };
 
-                        for row in batch_rows {
-                            let values_str = row
-                                .into_iter()
-                                .map(|val| match val {
-                                    MysqlValue::String(v) => format!("'{}'", v.replace('\\', "\\\\").replace('\'', "\\'")),
-                                    MysqlValue::Bytes(b) => format!("X'{}'", hex::encode(&b)),
-                                    MysqlValue::Null => "NULL".into(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let insert_sql = format!("{} ({});", insert_prefix, values_str);
-                            conn.query_drop(&insert_sql).await.map_err(|e| {
-                                DumperError::Restore(format!(
+                        // Wrap batch slice in a transaction for atomicity and high insert throughput
+                        conn.query_drop("START TRANSACTION;").await.map_err(|e| {
+                            DumperError::Restore(format!("Failed to start transaction: {}", e))
+                        })?;
+
+                        const MYSQL_INSERT_BATCH_SIZE: usize = 200;
+                        for chunk in batch_rows.chunks(MYSQL_INSERT_BATCH_SIZE) {
+                            let mut values_clauses = Vec::with_capacity(chunk.len());
+                            for row in chunk {
+                                let values_str = row
+                                    .iter()
+                                    .map(|val| match val {
+                                        MysqlValue::String(v) => escape_mysql_string(v),
+                                        MysqlValue::Bytes(b) => format!("X'{}'", hex::encode(b)),
+                                        MysqlValue::Null => "NULL".into(),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                values_clauses.push(format!("({})", values_str));
+                            }
+                            let insert_sql =
+                                format!("{} {};", insert_prefix, values_clauses.join(", "));
+                            if let Err(e) = conn.query_drop(&insert_sql).await {
+                                let _ = conn.query_drop("ROLLBACK;").await;
+                                return Err(DumperError::Restore(format!(
                                     "Failed to insert row into table '{}': {}",
                                     d.table_name, e
-                                ))
-                            })?;
+                                )));
+                            }
+                        }
+
+                        if let Err(e) = conn.query_drop("COMMIT;").await {
+                            let _ = conn.query_drop("ROLLBACK;").await;
+                            return Err(DumperError::Restore(format!(
+                                "Failed to commit transaction for table '{}': {}",
+                                d.table_name, e
+                            )));
                         }
                     }
                 }
@@ -409,7 +509,10 @@ impl DatabaseAdapter for MysqlAdapter {
                 }
                 StreamRecord::Routine(r) => {
                     conn.query_drop(&r.sql).await.map_err(|e| {
-                        DumperError::Restore(format!("Failed to create routine/view '{}' in MySQL: {}", r.name, e))
+                        DumperError::Restore(format!(
+                            "Failed to create routine/view '{}' in MySQL: {}",
+                            r.name, e
+                        ))
                     })?;
                 }
                 StreamRecord::Trailer(_) => break,
@@ -421,5 +524,33 @@ impl DatabaseAdapter for MysqlAdapter {
             tables_restored,
             records_processed,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_mysql_string_basic() {
+        assert_eq!(escape_mysql_string("simple"), "'simple'");
+        assert_eq!(escape_mysql_string(""), "''");
+    }
+
+    #[test]
+    fn test_escape_mysql_string_special_chars() {
+        assert_eq!(escape_mysql_string("O'Reilly"), "'O\\'Reilly'");
+        assert_eq!(escape_mysql_string(r#"say "hello""#), r#"'say \"hello\"'"#);
+        assert_eq!(
+            escape_mysql_string(r"C:\Program Files"),
+            r"'C:\\Program Files'"
+        );
+        assert_eq!(
+            escape_mysql_string("line1\nline2\rline3\ttab"),
+            "'line1\\nline2\\rline3\\ttab'"
+        );
+        assert_eq!(escape_mysql_string("null\0byte"), "'null\\0byte'");
+        assert_eq!(escape_mysql_string("ctrl\x1Az"), "'ctrl\\Zz'");
+        assert_eq!(escape_mysql_string("back\x08space"), "'back\\bspace'");
     }
 }
