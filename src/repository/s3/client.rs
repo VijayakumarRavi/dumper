@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
-use std::time::Duration;
-use chrono::Utc;
-use reqwest::{Client, Method, Response, StatusCode};
-use rand::Rng;
 use crate::error::DumperError;
 use crate::repository::backend::StorageBackend;
 use crate::repository::s3::sigv4::SigV4Signer;
+use chrono::Utc;
+use rand::Rng;
+use reqwest::{Client, Method, Response, StatusCode};
+use std::collections::BTreeMap;
+use std::time::Duration;
 
 pub struct S3Client {
     client: Client,
@@ -209,7 +209,10 @@ impl StorageBackend for S3Client {
             .send_request_with_retry(Method::GET, &key, BTreeMap::new(), Vec::new())
             .await?;
         if resp.status() == StatusCode::NOT_FOUND {
-            return Err(DumperError::Repository(format!("Object '{}' not found", path)));
+            return Err(DumperError::Repository(format!(
+                "Object '{}' not found",
+                path
+            )));
         }
         if !resp.status().is_success() {
             let status = resp.status();
@@ -224,6 +227,33 @@ impl StorageBackend for S3Client {
             .await
             .map_err(|e| DumperError::S3(format!("Failed to read S3 response body: {}", e)))?;
         Ok(bytes.to_vec())
+    }
+
+    async fn get_object_size(&self, path: &str) -> Result<u64, DumperError> {
+        let key = self.full_key(path);
+        let resp = self
+            .send_request_with_retry(Method::HEAD, &key, BTreeMap::new(), Vec::new())
+            .await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Err(DumperError::Repository(format!(
+                "Object '{}' not found",
+                path
+            )));
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(DumperError::S3(format!(
+                "Failed to HEAD S3 object '{}' (HTTP {})",
+                key, status
+            )));
+        }
+        let len = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok(len)
     }
 
     async fn object_exists(&self, path: &str) -> Result<bool, DumperError> {
@@ -275,13 +305,18 @@ impl StorageBackend for S3Client {
                 )));
             }
 
-            let body = resp.text().await.map_err(|e| DumperError::S3(e.to_string()))?;
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| DumperError::S3(e.to_string()))?;
 
             // Lightweight XML parsing of <Key> and <NextContinuationToken>
             for key_match in extract_xml_tags(&body, "Key") {
                 // Strip the repository prefix
                 let clean_key = if !self.prefix.is_empty() && key_match.starts_with(&self.prefix) {
-                    key_match[self.prefix.len()..].trim_start_matches('/').to_string()
+                    key_match[self.prefix.len()..]
+                        .trim_start_matches('/')
+                        .to_string()
                 } else {
                     key_match
                 };

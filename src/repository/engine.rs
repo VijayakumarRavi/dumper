@@ -1,6 +1,3 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-use sha2::{Digest, Sha256};
 use crate::cli::CompressionLevel;
 use crate::compression::{compress_data, decompress_data};
 use crate::crypto::aead::{decrypt_blob, encrypt_blob};
@@ -8,6 +5,9 @@ use crate::error::DumperError;
 use crate::repository::backend::StorageBackend;
 use crate::repository::config::{RepositoryConfig, CONFIG_FILE_PATH};
 use crate::repository::snapshot::{BlobReference, SnapshotMetadata};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub struct RepositoryEngine<B: StorageBackend> {
     backend: Arc<B>,
@@ -49,7 +49,8 @@ impl<B: StorageBackend> RepositoryEngine<B> {
     pub async fn open(backend: Arc<B>, password: &str) -> Result<Self, DumperError> {
         if !backend.object_exists(CONFIG_FILE_PATH).await? {
             return Err(DumperError::Repository(
-                "Repository is not initialized (missing config file). Run 'dumper init' first.".into(),
+                "Repository is not initialized (missing config file). Run 'dumper init' first."
+                    .into(),
             ));
         }
 
@@ -159,7 +160,10 @@ impl<B: StorageBackend> RepositoryEngine<B> {
                 DumperError::Repository(format!("Failed to read snapshot '{}': {}", key, e))
             })?;
             let snapshot = serde_json::from_slice::<SnapshotMetadata>(&data).map_err(|e| {
-                DumperError::Format(format!("Failed to parse snapshot metadata in '{}': {}", key, e))
+                DumperError::Format(format!(
+                    "Failed to parse snapshot metadata in '{}': {}",
+                    key, e
+                ))
             })?;
             snapshots.push(snapshot);
         }
@@ -206,10 +210,10 @@ impl<B: StorageBackend> RepositoryEngine<B> {
         let mut deleted_bytes = 0u64;
 
         for blob_key in all_blobs {
-            let hash = blob_key.split('/').last().unwrap_or("");
+            let hash = blob_key.split('/').next_back().unwrap_or("");
             if !referenced_hashes.contains(hash) {
-                if let Ok(data) = self.backend.get_object(&blob_key).await {
-                    deleted_bytes += data.len() as u64;
+                if let Ok(size) = self.backend.get_object_size(&blob_key).await {
+                    deleted_bytes += size;
                 }
                 let _ = self.backend.delete_object(&blob_key).await;
                 deleted_count += 1;
@@ -277,17 +281,25 @@ mod tests {
         let password = "test-repo-password";
 
         // 1. Init
-        let engine = RepositoryEngine::init(backend.clone(), password).await.unwrap();
+        let engine = RepositoryEngine::init(backend.clone(), password)
+            .await
+            .unwrap();
 
         // 2. Put chunk 1
         let chunk1 = b"Sample database row data block 1";
         let hash1 = hex::encode(Sha256::digest(chunk1));
-        let (ref1, dedup1) = engine.put_chunk(chunk1, &hash1, CompressionLevel::Default).await.unwrap();
+        let (ref1, dedup1) = engine
+            .put_chunk(chunk1, &hash1, CompressionLevel::Default)
+            .await
+            .unwrap();
         assert!(!dedup1);
         assert_eq!(ref1.hash, hash1);
 
         // 3. Put chunk 1 again -> must be deduplicated!
-        let (ref1_dup, dedup1_dup) = engine.put_chunk(chunk1, &hash1, CompressionLevel::Default).await.unwrap();
+        let (ref1_dup, dedup1_dup) = engine
+            .put_chunk(chunk1, &hash1, CompressionLevel::Default)
+            .await
+            .unwrap();
         assert!(dedup1_dup);
         assert_eq!(ref1_dup.hash, hash1);
 

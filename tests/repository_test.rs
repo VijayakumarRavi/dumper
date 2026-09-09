@@ -1,9 +1,9 @@
-use std::sync::Arc;
-use sha2::{Digest, Sha256};
 use dumper::cli::CompressionLevel;
 use dumper::repository::engine::RepositoryEngine;
 use dumper::repository::local::LocalBackend;
 use dumper::repository::snapshot::SnapshotMetadata;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 #[tokio::test]
 async fn test_full_repository_lifecycle_and_deduplication() {
@@ -12,20 +12,29 @@ async fn test_full_repository_lifecycle_and_deduplication() {
     let password = "production-grade-password-123";
 
     // 1. Initialize Repository
-    let engine = RepositoryEngine::init(backend.clone(), password).await.unwrap();
+    let engine = RepositoryEngine::init(backend.clone(), password)
+        .await
+        .unwrap();
 
     // 2. Prepare Sample Database Data Blocks
-    let block_a = b"TABLE users (id INT, email TEXT); INSERT INTO users VALUES (1, 'alice@example.com');";
+    let block_a =
+        b"TABLE users (id INT, email TEXT); INSERT INTO users VALUES (1, 'alice@example.com');";
     let block_b = b"TABLE orders (id INT, user_id INT); INSERT INTO orders VALUES (101, 1);";
 
     let hash_a = hex::encode(Sha256::digest(block_a));
     let hash_b = hex::encode(Sha256::digest(block_b));
 
     // 3. Backup 1: Store block A and block B
-    let (ref_a1, dedup_a1) = engine.put_chunk(block_a, &hash_a, CompressionLevel::Default).await.unwrap();
+    let (ref_a1, dedup_a1) = engine
+        .put_chunk(block_a, &hash_a, CompressionLevel::Default)
+        .await
+        .unwrap();
     assert!(!dedup_a1, "First upload must not be deduplicated");
 
-    let (ref_b1, dedup_b1) = engine.put_chunk(block_b, &hash_b, CompressionLevel::Default).await.unwrap();
+    let (ref_b1, dedup_b1) = engine
+        .put_chunk(block_b, &hash_b, CompressionLevel::Default)
+        .await
+        .unwrap();
     assert!(!dedup_b1, "First upload must not be deduplicated");
 
     let snap1 = SnapshotMetadata {
@@ -53,11 +62,23 @@ async fn test_full_repository_lifecycle_and_deduplication() {
     let block_c = b"TABLE audit_log (event TEXT); INSERT INTO audit_log VALUES ('user_created');";
     let hash_c = hex::encode(Sha256::digest(block_c));
 
-    let (ref_a2, dedup_a2) = engine.put_chunk(block_a, &hash_a, CompressionLevel::Default).await.unwrap();
-    assert!(dedup_a2, "Identical block A MUST be deduplicated across backups!");
-    assert_eq!(ref_a2.stored_size, 0, "Deduplicated block stores 0 new bytes");
+    let (ref_a2, dedup_a2) = engine
+        .put_chunk(block_a, &hash_a, CompressionLevel::Default)
+        .await
+        .unwrap();
+    assert!(
+        dedup_a2,
+        "Identical block A MUST be deduplicated across backups!"
+    );
+    assert_eq!(
+        ref_a2.stored_size, 0,
+        "Deduplicated block stores 0 new bytes"
+    );
 
-    let (ref_c2, dedup_c2) = engine.put_chunk(block_c, &hash_c, CompressionLevel::Default).await.unwrap();
+    let (ref_c2, dedup_c2) = engine
+        .put_chunk(block_c, &hash_c, CompressionLevel::Default)
+        .await
+        .unwrap();
     assert!(!dedup_c2, "New block C must be stored");
 
     let snap2 = SnapshotMetadata {
@@ -99,7 +120,10 @@ async fn test_full_repository_lifecycle_and_deduplication() {
 
     // Block B was only in snapshot 1, so prune should delete block B, keeping block A and C
     let (deleted_blobs, _deleted_bytes) = engine.prune().await.unwrap();
-    assert_eq!(deleted_blobs, 1, "Only unreferenced block B should be pruned");
+    assert_eq!(
+        deleted_blobs, 1,
+        "Only unreferenced block B should be pruned"
+    );
 
     // Verify snapshot 2 is still 100% intact after prune!
     let v2_after_prune = engine.verify_snapshot(&snap2).await.unwrap();
@@ -118,11 +142,16 @@ async fn test_full_repository_lifecycle_and_deduplication() {
 async fn test_prune_safety_on_corrupt_or_unreadable_snapshot() {
     let temp_dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(LocalBackend::new(temp_dir.path()).await.unwrap());
-    let engine = RepositoryEngine::init(backend.clone(), "test-pass").await.unwrap();
+    let engine = RepositoryEngine::init(backend.clone(), "test-pass")
+        .await
+        .unwrap();
 
     let block = b"Critical live table data";
     let hash = hex::encode(Sha256::digest(block));
-    let (blob_ref, _) = engine.put_chunk(block, &hash, CompressionLevel::Default).await.unwrap();
+    let (blob_ref, _) = engine
+        .put_chunk(block, &hash, CompressionLevel::Default)
+        .await
+        .unwrap();
 
     let snap = SnapshotMetadata {
         id: "snap_valid".into(),
@@ -147,14 +176,158 @@ async fn test_prune_safety_on_corrupt_or_unreadable_snapshot() {
 
     // Intentionally create an unreadable / corrupted snapshot in the snapshots directory
     use dumper::repository::backend::StorageBackend;
-    backend.put_object("snapshots/corrupt_snap", b"NOT_VALID_JSON").await.unwrap();
+    backend
+        .put_object("snapshots/corrupt_snap", b"NOT_VALID_JSON")
+        .await
+        .unwrap();
 
     // prune() MUST abort with an error and must NOT delete any blobs!
     let prune_res = engine.prune().await;
-    assert!(prune_res.is_err(), "prune() must fail when any snapshot cannot be parsed");
+    assert!(
+        prune_res.is_err(),
+        "prune() must fail when any snapshot cannot be parsed"
+    );
 
     // Verify blob is still intact in storage
     let fetched = engine.get_chunk(&hash).await.unwrap();
     assert_eq!(fetched, block);
 }
 
+#[tokio::test]
+async fn test_prune_does_not_download_blob_payloads() {
+    use dumper::repository::backend::StorageBackend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingBackend {
+        inner: LocalBackend,
+        blob_get_object_calls: AtomicUsize,
+        blob_get_object_size_calls: AtomicUsize,
+    }
+
+    impl StorageBackend for CountingBackend {
+        async fn put_object<'a>(
+            &'a self,
+            path: &'a str,
+            data: &'a [u8],
+        ) -> Result<(), dumper::error::DumperError> {
+            self.inner.put_object(path, data).await
+        }
+        async fn get_object<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> Result<Vec<u8>, dumper::error::DumperError> {
+            if path.starts_with("blobs/") {
+                self.blob_get_object_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get_object(path).await
+        }
+        async fn get_object_size<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> Result<u64, dumper::error::DumperError> {
+            if path.starts_with("blobs/") {
+                self.blob_get_object_size_calls
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get_object_size(path).await
+        }
+        async fn object_exists<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> Result<bool, dumper::error::DumperError> {
+            self.inner.object_exists(path).await
+        }
+        async fn delete_object<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> Result<(), dumper::error::DumperError> {
+            self.inner.delete_object(path).await
+        }
+        async fn list_objects<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> Result<Vec<String>, dumper::error::DumperError> {
+            self.inner.list_objects(prefix).await
+        }
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let local = LocalBackend::new(temp_dir.path()).await.unwrap();
+    let counting_backend = Arc::new(CountingBackend {
+        inner: local,
+        blob_get_object_calls: AtomicUsize::new(0),
+        blob_get_object_size_calls: AtomicUsize::new(0),
+    });
+
+    let engine = RepositoryEngine::init(counting_backend.clone(), "test-pass")
+        .await
+        .unwrap();
+
+    // Store a referenced chunk and commit snapshot
+    let (ref_1, _) = engine
+        .put_chunk(b"live chunk", "hash_live", CompressionLevel::Default)
+        .await
+        .unwrap();
+    let snap = SnapshotMetadata {
+        id: "snap1".into(),
+        full_id: "snap1_full".into(),
+        format_version: 1,
+        dumper_version: "0.1.0".into(),
+        engine: "test".into(),
+        database: "test".into(),
+        server_version: "1.0".into(),
+        started_at: chrono::Utc::now(),
+        completed_at: chrono::Utc::now(),
+        duration_seconds: 1,
+        logical_bytes: 100,
+        stored_bytes: 100,
+        deduplicated_bytes: 0,
+        table_count: 1,
+        compression: "default".into(),
+        tag: None,
+        blobs: vec![ref_1],
+    };
+    engine.commit_snapshot(&snap).await.unwrap();
+
+    // Store an orphaned / unreferenced chunk
+    let (ref_orphan, _) = engine
+        .put_chunk(b"orphan chunk", "hash_orphan", CompressionLevel::Default)
+        .await
+        .unwrap();
+    assert!(ref_orphan.stored_size > 0);
+
+    // Reset counters before prune
+    counting_backend
+        .blob_get_object_calls
+        .store(0, Ordering::SeqCst);
+    counting_backend
+        .blob_get_object_size_calls
+        .store(0, Ordering::SeqCst);
+
+    // Run prune
+    let (deleted_count, deleted_bytes) = engine.prune().await.unwrap();
+    assert_eq!(
+        deleted_count, 1,
+        "Exactly one orphaned blob should be pruned"
+    );
+    assert!(
+        deleted_bytes > 0,
+        "Deleted bytes should be accurately recorded"
+    );
+
+    // VERIFICATION: get_object must NOT have been called for any blob!
+    assert_eq!(
+        counting_backend
+            .blob_get_object_calls
+            .load(Ordering::SeqCst),
+        0,
+        "prune() must NEVER download blob payloads using get_object()!"
+    );
+    assert_eq!(
+        counting_backend
+            .blob_get_object_size_calls
+            .load(Ordering::SeqCst),
+        1,
+        "prune() should use lightweight get_object_size() instead"
+    );
+}

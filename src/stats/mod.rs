@@ -1,9 +1,9 @@
-use std::collections::HashSet;
-use serde::Serialize;
 use crate::error::DumperError;
 use crate::repository::backend::StorageBackend;
 use crate::repository::snapshot::SnapshotMetadata;
 use crate::ui::progress::format_bytes;
+use serde::Serialize;
+use std::collections::HashSet;
 
 #[derive(Serialize, Debug)]
 pub struct RepositoryStats {
@@ -36,8 +36,8 @@ pub async fn compute_stats<B: StorageBackend>(
         let all_blobs = backend.list_objects("blobs").await?;
         let mut total = 0u64;
         for blob_key in all_blobs {
-            if let Ok(data) = backend.get_object(&blob_key).await {
-                total += data.len() as u64;
+            if let Ok(size) = backend.get_object_size(&blob_key).await {
+                total += size;
             }
         }
         total
@@ -63,7 +63,13 @@ pub async fn compute_stats<B: StorageBackend>(
 pub fn print_stats_table(stats: &RepositoryStats) {
     println!("Snapshots:             {}", stats.total_snapshots);
     println!("Unique blobs:          {}", stats.unique_blobs);
-    println!("Repository size:       {}", format_bytes(stats.repository_stored_bytes));
-    println!("Logical backup size:   {}", format_bytes(stats.total_logical_bytes));
+    println!(
+        "Repository size:       {}",
+        format_bytes(stats.repository_stored_bytes)
+    );
+    println!(
+        "Logical backup size:   {}",
+        format_bytes(stats.total_logical_bytes)
+    );
     println!("Deduplication ratio:   {:.1}x", stats.deduplication_ratio);
 }

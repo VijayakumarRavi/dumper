@@ -1,8 +1,8 @@
+use crate::error::DumperError;
+use crate::repository::backend::StorageBackend;
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
-use crate::error::DumperError;
-use crate::repository::backend::StorageBackend;
 
 pub struct LocalBackend {
     base_path: PathBuf,
@@ -15,9 +15,14 @@ impl LocalBackend {
             DumperError::Repository(format!("Failed to create repository directory: {}", e))
         })?;
         let canonical = fs::canonicalize(&base_path).await.map_err(|e| {
-            DumperError::Repository(format!("Failed to canonicalize repository directory: {}", e))
+            DumperError::Repository(format!(
+                "Failed to canonicalize repository directory: {}",
+                e
+            ))
         })?;
-        Ok(Self { base_path: canonical })
+        Ok(Self {
+            base_path: canonical,
+        })
     }
 
     fn resolve_path(&self, rel_path: &str) -> Result<PathBuf, DumperError> {
@@ -43,11 +48,7 @@ impl StorageBackend for LocalBackend {
         }
 
         // Atomic write: write to a temporary file in the same directory, sync, then rename
-        let tmp_filename = format!(
-            ".tmp_{}_{}",
-            std::process::id(),
-            rand::random::<u64>()
-        );
+        let tmp_filename = format!(".tmp_{}_{}", std::process::id(), rand::random::<u64>());
         let tmp_path = target_path
             .parent()
             .unwrap_or(&self.base_path)
@@ -82,6 +83,17 @@ impl StorageBackend for LocalBackend {
         fs::read(&target_path).await.map_err(|e| {
             DumperError::Repository(format!("Failed to read object '{}': {}", path, e))
         })
+    }
+
+    async fn get_object_size(&self, path: &str) -> Result<u64, DumperError> {
+        let target_path = self.resolve_path(path)?;
+        let meta = fs::metadata(&target_path).await.map_err(|e| {
+            DumperError::Repository(format!(
+                "Failed to get metadata for object '{}': {}",
+                path, e
+            ))
+        })?;
+        Ok(meta.len())
     }
 
     async fn object_exists(&self, path: &str) -> Result<bool, DumperError> {
