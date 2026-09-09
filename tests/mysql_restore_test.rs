@@ -1,10 +1,10 @@
+use dumper::database::mysql::MysqlAdapter;
+use dumper::database::{DatabaseAdapter, RestoreOptions};
+use dumper::stream::decoder::StreamDecoder;
+use dumper::stream::encoder::StreamEncoder;
+use dumper::stream::format::*;
 use std::process::{Child, Command};
 use tempfile::TempDir;
-use dumper::database::{DatabaseAdapter, RestoreOptions};
-use dumper::database::mysql::MysqlAdapter;
-use dumper::stream::encoder::StreamEncoder;
-use dumper::stream::decoder::StreamDecoder;
-use dumper::stream::format::*;
 
 struct TestMysqlServer {
     _dir: TempDir,
@@ -19,8 +19,13 @@ impl TestMysqlServer {
         let port = 53300 + (std::process::id() % 1000) as u16;
 
         let install_status = Command::new("mariadb-install-db")
-            .args(["--datadir", path, "--auth-root-authentication-method=normal"])
-            .output().ok()?;
+            .args([
+                "--datadir",
+                path,
+                "--auth-root-authentication-method=normal",
+            ])
+            .output()
+            .ok()?;
         if !install_status.status.success() {
             return None;
         }
@@ -32,17 +37,31 @@ impl TestMysqlServer {
                 format!("--socket={}/mysql.sock", path),
                 "--bind-address=127.0.0.1".into(),
             ])
-            .spawn().ok()?;
+            .spawn()
+            .ok()?;
 
         // Wait up to 5 seconds for server to respond
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let check = Command::new("mariadb")
-                .args(["-h", "127.0.0.1", "-P", &port.to_string(), "-u", "root", "-e", "CREATE DATABASE IF NOT EXISTS testdb"])
+                .args([
+                    "-h",
+                    "127.0.0.1",
+                    "-P",
+                    &port.to_string(),
+                    "-u",
+                    "root",
+                    "-e",
+                    "CREATE DATABASE IF NOT EXISTS testdb",
+                ])
                 .output();
             if let Ok(out) = check {
                 if out.status.success() {
-                    return Some(Self { dir, child, port });
+                    return Some(Self {
+                        _dir: dir,
+                        child,
+                        port,
+                    });
                 }
             }
         }
@@ -87,7 +106,10 @@ async fn test_mysql_restore_propagates_insert_error() {
             dumper_version: "0.1.0".into(),
             start_time: 1700000000,
         };
-        encoder.write_record(&StreamRecord::Header(header)).await.unwrap();
+        encoder
+            .write_record(&StreamRecord::Header(header))
+            .await
+            .unwrap();
 
         // Create table with integer primary key
         let schema = TableSchemaRecord {
@@ -101,7 +123,10 @@ async fn test_mysql_restore_propagates_insert_error() {
             }],
             create_sql: "CREATE TABLE `users` (`id` int NOT NULL, PRIMARY KEY (`id`));".into(),
         };
-        encoder.write_record(&StreamRecord::TableSchema(schema)).await.unwrap();
+        encoder
+            .write_record(&StreamRecord::TableSchema(schema))
+            .await
+            .unwrap();
 
         // Invalid row data: string "not_a_valid_integer" for INT NOT NULL column in strict mode
         // Or duplicate PK row in batch
@@ -124,7 +149,10 @@ async fn test_mysql_restore_propagates_insert_error() {
             is_last: true,
             data: slice_data,
         };
-        encoder.write_record(&StreamRecord::TableDataSlice(data_slice)).await.unwrap();
+        encoder
+            .write_record(&StreamRecord::TableDataSlice(data_slice))
+            .await
+            .unwrap();
 
         encoder.finish().await.unwrap();
     }
@@ -145,6 +173,8 @@ async fn test_mysql_restore_propagates_insert_error() {
                 err_msg
             );
         }
-        Ok(_) => panic!("Restore must fail when row insert fails due to duplicate key or invalid data"),
+        Ok(_) => {
+            panic!("Restore must fail when row insert fails due to duplicate key or invalid data")
+        }
     }
 }
