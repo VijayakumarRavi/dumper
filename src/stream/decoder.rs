@@ -10,6 +10,7 @@ pub struct StreamDecoder<R: AsyncRead + Unpin + Send> {
     records_read: u64,
     bytes_read: u64,
     reached_eof: bool,
+    trailer_verified: bool,
     stream_hasher: Sha256,
 }
 
@@ -21,6 +22,7 @@ impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
             records_read: 0,
             bytes_read: 0,
             reached_eof: false,
+            trailer_verified: false,
             stream_hasher: Sha256::new(),
         }
     }
@@ -44,7 +46,7 @@ impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
         Ok(())
     }
 
-    /// Read next record from the stream. Returns `None` at EOF or after Trailer.
+    /// Read next record from the stream. Returns `None` at EOF after valid Trailer.
     pub async fn read_next_record(&mut self) -> Result<Option<StreamRecord>, DumperError> {
         if self.reached_eof {
             return Ok(None);
@@ -56,8 +58,14 @@ impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
         match self.reader.read_exact(&mut header).await {
             Ok(_) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                self.reached_eof = true;
-                return Ok(None);
+                if self.trailer_verified {
+                    self.reached_eof = true;
+                    return Ok(None);
+                } else {
+                    return Err(DumperError::Integrity(
+                        "Stream ended prematurely before Trailer record was received".into(),
+                    ));
+                }
             }
             Err(e) => return Err(DumperError::Io(e)),
         }
@@ -77,10 +85,28 @@ impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
         }
 
         let mut payload = vec![0u8; payload_len];
-        self.reader.read_exact(&mut payload).await?;
+        self.reader.read_exact(&mut payload).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                DumperError::Integrity(format!(
+                    "Stream truncated while reading payload for record {}",
+                    self.records_read
+                ))
+            } else {
+                DumperError::Io(e)
+            }
+        })?;
 
         let mut crc_bytes = [0u8; 4];
-        self.reader.read_exact(&mut crc_bytes).await?;
+        self.reader.read_exact(&mut crc_bytes).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                DumperError::Integrity(format!(
+                    "Stream truncated while reading CRC for record {}",
+                    self.records_read
+                ))
+            } else {
+                DumperError::Io(e)
+            }
+        })?;
         let expected_crc = u32::from_le_bytes(crc_bytes);
 
         // Verify CRC
@@ -152,6 +178,13 @@ impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
                         t.stream_hash_hex, expected_hash
                     )));
                 }
+                if t.total_records != self.records_read - 1 {
+                    return Err(DumperError::Integrity(format!(
+                        "Stream total records mismatch: expected {}, calculated {}",
+                        t.total_records, self.records_read - 1
+                    )));
+                }
+                self.trailer_verified = true;
                 self.reached_eof = true;
                 StreamRecord::Trailer(t)
             }

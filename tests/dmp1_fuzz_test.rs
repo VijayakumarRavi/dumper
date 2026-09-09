@@ -40,3 +40,74 @@ async fn test_fuzz_oversized_payload() {
     let res = decoder.read_next_record().await;
     assert!(matches!(res, Err(DumperError::Integrity(ref s)) if s.contains("exceeds maximum allowed frame limit")));
 }
+
+#[tokio::test]
+async fn test_truncated_stream_missing_trailer_fails_with_integrity_error() {
+    use dumper::stream::encoder::StreamEncoder;
+    use dumper::stream::format::*;
+
+    let mut buffer = Vec::new();
+    {
+        let mut encoder = StreamEncoder::new(&mut buffer);
+        let header = StreamHeader {
+            version: 1,
+            engine: "postgresql".into(),
+            database: "app".into(),
+            server_version: "17".into(),
+            dumper_version: "0.1.0".into(),
+            start_time: 1700000000,
+        };
+        encoder.write_record(&StreamRecord::Header(header)).await.unwrap();
+        // Intentionally DO NOT write trailer / finish encoder!
+    }
+
+    let mut decoder = StreamDecoder::new(&buffer[..]);
+    let r1 = decoder.read_next_record().await.unwrap();
+    assert!(r1.is_some());
+
+    // Second read encounters EOF before Trailer record was seen
+    let r2 = decoder.read_next_record().await;
+    assert!(
+        matches!(r2, Err(DumperError::Integrity(ref s)) if s.contains("before Trailer record was received")),
+        "Stream ending before trailer MUST return Integrity error, got: {:?}",
+        r2
+    );
+}
+
+#[tokio::test]
+async fn test_truncated_payload_fails_with_integrity_error() {
+    use dumper::stream::encoder::StreamEncoder;
+    use dumper::stream::format::*;
+
+    let mut buffer = Vec::new();
+    {
+        let mut encoder = StreamEncoder::new(&mut buffer);
+        let header = StreamHeader {
+            version: 1,
+            engine: "postgresql".into(),
+            database: "app".into(),
+            server_version: "17".into(),
+            dumper_version: "0.1.0".into(),
+            start_time: 1700000000,
+        };
+        encoder.write_record(&StreamRecord::Header(header)).await.unwrap();
+        encoder.finish().await.unwrap();
+    }
+
+    // Truncate buffer in the middle of a record (e.g. drop last 10 bytes)
+    let truncated_len = buffer.len() - 10;
+    let truncated = &buffer[..truncated_len];
+
+    let mut decoder = StreamDecoder::new(truncated);
+    let mut found_error = false;
+    while let Ok(Some(_)) = decoder.read_next_record().await {}
+    // Next read should trigger Integrity error
+    let res = decoder.read_next_record().await;
+    if let Err(DumperError::Integrity(ref s)) = res {
+        if s.contains("truncated") || s.contains("before Trailer") || s.contains("CRC32") {
+            found_error = true;
+        }
+    }
+    assert!(found_error, "Truncated payload or record must fail with Integrity error, got: {:?}", res);
+}
+
