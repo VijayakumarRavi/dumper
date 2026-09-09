@@ -21,7 +21,7 @@ Designed to run safely inside edge containers (64–128 MB RAM, 0.25–1 vCPU) w
 - **Content-Addressed Deduplication**: Chunks are content-hashed (SHA-256) and deduplicated across all snapshots. Identical data is stored only once.
 - **Client-Side Authenticated Encryption**: Authenticated AEAD encryption (**XChaCha20-Poly1305**) with a master key derived via **Argon2id** password hashing. Keys never leave the client.
 - **Streaming Zstandard Compression**: Multi-level zstd compression (`none`, `fast`, `default`, `max`).
-- **S3 as a First-Class Backend**: Built-in AWS SigV4 signer supporting Amazon S3, MinIO, Cloudflare R2, Wasabi, Backblaze B2, and Garage.
+- **S3 as a First-Class Backend**: Built-in AWS SigV4 signer supporting Amazon S3, MinIO, Cloudflare R2, Wasabi, Backblaze B2, and Garage (MinIO continuously validated in CI; see COMPATIBILITY.md for details).
 - **Crash Safety**: Atomic snapshot commits. Partial or failed backups remain uncommitted and never corrupt previous snapshots.
 - **Full Lifecycle**: `init`, `backup`, `snapshots`, `info`, `restore`, `verify`, `check`, `forget`, `prune`, `stats`, and `unlock`.
 
