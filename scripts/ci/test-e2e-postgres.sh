@@ -74,7 +74,10 @@ psql "$DB_URL" -t -A -F $'\t' -c \
     "SELECT log_id, event, metadata::text FROM audit_log ORDER BY log_id;" > "$WORKDIR/audit_before.tsv"
 
 psql "$DB_URL" -t -A -F $'\t' -c \
-    "SELECT table_name, constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_schema='public' ORDER BY table_name, constraint_name;" > "$WORKDIR/constraints_before.tsv"
+    "SELECT table_name, constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_schema='public' AND constraint_name NOT LIKE '%_not_null' ORDER BY table_name, constraint_name;" > "$WORKDIR/constraints_before.tsv"
+
+psql "$DB_URL" -t -A -F $'\t' -c \
+    "SELECT table_name, column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema='public' ORDER BY table_name, ordinal_position;" > "$WORKDIR/columns_before.tsv"
 
 psql "$DB_URL" -t -A -F $'\t' -c \
     "SELECT sequencename, last_value FROM pg_sequences WHERE schemaname='public' ORDER BY sequencename;" > "$WORKDIR/sequences_before.tsv"
@@ -116,7 +119,10 @@ psql "$DB_URL" -t -A -F $'\t' -c \
     "SELECT log_id, event, metadata::text FROM audit_log ORDER BY log_id;" > "$WORKDIR/audit_after.tsv"
 
 psql "$DB_URL" -t -A -F $'\t' -c \
-    "SELECT table_name, constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_schema='public' ORDER BY table_name, constraint_name;" > "$WORKDIR/constraints_after.tsv"
+    "SELECT table_name, constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_schema='public' AND constraint_name NOT LIKE '%_not_null' ORDER BY table_name, constraint_name;" > "$WORKDIR/constraints_after.tsv"
+
+psql "$DB_URL" -t -A -F $'\t' -c \
+    "SELECT table_name, column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema='public' ORDER BY table_name, ordinal_position;" > "$WORKDIR/columns_after.tsv"
 
 psql "$DB_URL" -t -A -F $'\t' -c \
     "SELECT sequencename, last_value FROM pg_sequences WHERE schemaname='public' ORDER BY sequencename;" > "$WORKDIR/sequences_after.tsv"
@@ -127,6 +133,7 @@ diff -u "$WORKDIR/departments_before.tsv" "$WORKDIR/departments_after.tsv"
 diff -u "$WORKDIR/employees_before.tsv" "$WORKDIR/employees_after.tsv"
 diff -u "$WORKDIR/audit_before.tsv" "$WORKDIR/audit_after.tsv"
 diff -u "$WORKDIR/constraints_before.tsv" "$WORKDIR/constraints_after.tsv"
+diff -u "$WORKDIR/columns_before.tsv" "$WORKDIR/columns_after.tsv"
 diff -u "$WORKDIR/sequences_before.tsv" "$WORKDIR/sequences_after.tsv"
 
 # 8. Test inserting a new employee to verify restored sequences don't collide
