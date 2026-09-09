@@ -11,7 +11,10 @@
   ],
   "excludes": [
     "**/target",
-    "**/Cargo.lock"
+    "**/Cargo.lock",
+    "**/.agents/**",
+    "**/.gemini/**",
+    "**/.system_generated/**"
   ],
   "plugins": [
     "https://plugins.dprint.dev/markdown-0.17.8.wasm",

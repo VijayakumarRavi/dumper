@@ -95,21 +95,25 @@ dumper forget \
 ## 3. Disaster Recovery Runbook
 
 ### Step 1: Verify Repository Accessibility
+
 ```bash
 dumper check
 ```
 
 ### Step 2: Identify the Snapshot to Restore
+
 ```bash
 dumper snapshots
 ```
 
 ### Step 3: Run Stream Integrity Dry-Run
+
 ```bash
 dumper verify <snapshot-id> --restore-test
 ```
 
 ### Step 4: Stream Restore into Target Database
+
 ```bash
 dumper restore <snapshot-id> \
   --target postgres://postgres:password@recovery-host:5432/production \

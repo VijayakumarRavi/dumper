@@ -2,8 +2,8 @@
 
 **Dumper** is a tiny, production-grade database backup, restore, verification, retention, and repository-management CLI written in Rust for:
 
-* **PostgreSQL**
-* **MySQL / MariaDB**
+- **PostgreSQL**
+- **MySQL / MariaDB**
 
 Inspired by the operational models of `restic`, `pgBackRest`, and `mysqldump`, Dumper is built for a focused mission:
 
@@ -32,11 +32,13 @@ Designed to run safely inside edge containers (64–128 MB RAM, 0.25–1 vCPU) w
 ### 1. Initialize Repository
 
 #### Local Filesystem
+
 ```bash
 dumper init --repository /mnt/backups/postgres
 ```
 
 #### S3-Compatible Storage (AWS, MinIO, Garage, R2)
+
 ```bash
 export DUMPER_REPOSITORY="s3://my-backups/postgres"
 export DUMPER_PASSWORD="secure-repo-password"
@@ -50,20 +52,25 @@ dumper init
 ### 2. Backup a Database
 
 #### PostgreSQL
+
 ```bash
 dumper backup postgres://app_user:secret@localhost:5432/production_db
 ```
 
 #### MySQL / MariaDB
+
 ```bash
 dumper backup mysql://app_user:secret@localhost:3306/production_db
 ```
 
 ### 3. List Snapshots
+
 ```bash
 dumper snapshots
 ```
+
 Output:
+
 ```text
 ID          DATE                  ENGINE        DATABASE      LOGICAL     STORED    
 --------------------------------------------------------------------------------
@@ -71,6 +78,7 @@ ID          DATE                  ENGINE        DATABASE      LOGICAL     STORED
 ```
 
 ### 4. Verify Snapshot Data Integrity
+
 ```bash
 # Verify hashes, authenticated encryption, and decompression
 dumper verify 7c4f9c3a
@@ -80,21 +88,26 @@ dumper verify 7c4f9c3a --restore-test
 ```
 
 ### 5. Restore Database
+
 ```bash
 dumper restore 7c4f9c3a --target postgres://postgres:secret@recovery-host:5432/production_db
 ```
 
 ### 6. Retention and Garbage Collection
+
 ```bash
 # Forget older snapshots based on retention policies
 dumper forget --keep-last 7 --keep-daily 14 --keep-weekly 8 --keep-monthly 12 --prune
 ```
 
 ### 7. Repository Statistics
+
 ```bash
 dumper stats
 ```
+
 Output:
+
 ```text
 Snapshots:             31
 Unique blobs:           17,428
@@ -107,16 +120,16 @@ Deduplication ratio:   5.8x
 
 ## Configuration & Environment Variables
 
-| Variable | Flag | Description |
-|---|---|---|
-| `DUMPER_REPOSITORY` | `-r, --repository` | Local directory path or `s3://bucket/prefix` |
-| `DUMPER_PASSWORD` | `--password` | Repository encryption password |
-| `DUMPER_PASSWORD_FILE` | `--password-file` | Path to file containing password |
-| `DUMPER_S3_ENDPOINT` | `--endpoint` | S3 custom endpoint URL |
-| `DUMPER_S3_REGION` | `--region` | S3 region (default: `us-east-1`) |
-| `DUMPER_S3_ACCESS_KEY_ID` | `--s3-access-key-id` | S3 access key ID |
-| `DUMPER_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` | S3 secret access key |
-| `DUMPER_S3_SESSION_TOKEN` | `--s3-session-token` | Temporary AWS STS token |
+| Variable                      | Flag                     | Description                                  |
+| ----------------------------- | ------------------------ | -------------------------------------------- |
+| `DUMPER_REPOSITORY`           | `-r, --repository`       | Local directory path or `s3://bucket/prefix` |
+| `DUMPER_PASSWORD`             | `--password`             | Repository encryption password               |
+| `DUMPER_PASSWORD_FILE`        | `--password-file`        | Path to file containing password             |
+| `DUMPER_S3_ENDPOINT`          | `--endpoint`             | S3 custom endpoint URL                       |
+| `DUMPER_S3_REGION`            | `--region`               | S3 region (default: `us-east-1`)             |
+| `DUMPER_S3_ACCESS_KEY_ID`     | `--s3-access-key-id`     | S3 access key ID                             |
+| `DUMPER_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` | S3 secret access key                         |
+| `DUMPER_S3_SESSION_TOKEN`     | `--s3-session-token`     | Temporary AWS STS token                      |
 
 ---
 
@@ -124,15 +137,15 @@ Deduplication ratio:   5.8x
 
 Dumper returns stable exit codes for automated tooling and scripting:
 
-* `0`: Success
-* `1`: General runtime error
-* `2`: CLI usage / configuration error
-* `3`: Authentication error (invalid password)
-* `4`: Database connection / execution error
-* `5`: Repository / storage error
-* `6`: Data integrity verification failure
-* `7`: Database restore failure
-* `8`: Process interrupted (SIGINT / SIGTERM)
+- `0`: Success
+- `1`: General runtime error
+- `2`: CLI usage / configuration error
+- `3`: Authentication error (invalid password)
+- `4`: Database connection / execution error
+- `5`: Repository / storage error
+- `6`: Data integrity verification failure
+- `7`: Database restore failure
+- `8`: Process interrupted (SIGINT / SIGTERM)
 
 ---
 

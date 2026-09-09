@@ -2,15 +2,15 @@
 
 Build **Dumper**, a tiny production-grade database backup, restore, verification, retention, and repository-management CLI for:
 
-* PostgreSQL
-* MySQL
-* MariaDB
+- PostgreSQL
+- MySQL
+- MariaDB
 
 Dumper is inspired by the operational model of:
 
-* `restic`
-* `pgBackRest`
-* `mysqldump`
+- `restic`
+- `pgBackRest`
+- `mysqldump`
 
 but has a much narrower goal:
 
@@ -243,12 +243,12 @@ The primary remote backend is:
 
 It must work with:
 
-* Amazon S3
-* MinIO
-* Cloudflare R2
-* Wasabi
-* Backblaze B2 S3 API
-* other reasonably compatible S3 implementations
+- Amazon S3
+- MinIO
+- Cloudflare R2
+- Wasabi
+- Backblaze B2 S3 API
+- other reasonably compatible S3 implementations
 
 Do not hard-code AWS-specific assumptions where the standard S3 API can be used.
 
@@ -279,9 +279,9 @@ DUMPER_S3_SECRET_ACCESS_KEY=...
 
 Prefer credentials from:
 
-* environment
-* secret files
-* container secrets
+- environment
+- secret files
+- container secrets
 
 Never require AWS CLI configuration.
 
@@ -321,13 +321,13 @@ Use the minimum features necessary.
 
 Avoid accidentally enabling:
 
-* HTTP/2
-* compression
-* tracing stacks
-* DNS features
-* service discovery
-* unused cloud credential providers
-* large AWS service abstractions
+- HTTP/2
+- compression
+- tracing stacks
+- DNS features
+- service discovery
+- unused cloud credential providers
+- large AWS service abstractions
 
 unless genuinely required.
 
@@ -488,14 +488,14 @@ Do NOT directly copy restic's repository format.
 
 The format should be:
 
-* content-addressed
-* deduplicated
-* encrypted
-* compressed
-* integrity protected
-* append-friendly
-* crash safe
-* database agnostic
+- content-addressed
+- deduplicated
+- encrypted
+- compressed
+- integrity protected
+- append-friendly
+- crash safe
+- database agnostic
 
 Example conceptual structure:
 
@@ -706,12 +706,12 @@ where appropriate.
 
 Detect:
 
-* modified blobs
-* corrupted blobs
-* truncated blobs
-* missing blobs
-* invalid snapshot metadata
-* wrong encryption credentials
+- modified blobs
+- corrupted blobs
+- truncated blobs
+- missing blobs
+- invalid snapshot metadata
+- wrong encryption credentials
 
 Provide:
 
@@ -767,10 +767,10 @@ The implementation must produce a consistent logical backup.
 
 Use database-native mechanisms such as:
 
-* transactions
-* repeatable-read snapshots
-* COPY
-* catalog queries
+- transactions
+- repeatable-read snapshots
+- COPY
+- catalog queries
 
 where appropriate.
 
@@ -867,8 +867,8 @@ Large tables must have effectively constant memory requirements.
 
 Support:
 
-* MySQL 8+
-* practical MariaDB versions
+- MySQL 8+
+- practical MariaDB versions
 
 Do not invoke:
 
@@ -899,9 +899,9 @@ Do not unnecessarily lock the whole database.
 
 Document behavior for:
 
-* InnoDB
-* non-transactional tables
-* MyISAM or equivalent engines
+- InnoDB
+- non-transactional tables
+- MyISAM or equivalent engines
 
 Do not pretend all MySQL storage engines provide identical consistency guarantees.
 
@@ -933,11 +933,11 @@ where supported.
 
 Connections must be:
 
-* TLS-capable
-* timeout-controlled
-* cancellable
-* bounded
-* cleanly closed
+- TLS-capable
+- timeout-controlled
+- cancellable
+- bounded
+- cleanly closed
 
 Provide configurable:
 
@@ -981,12 +981,12 @@ Trailer
 
 The format must be:
 
-* versioned
-* streamable
-* self-describing enough for restore
-* forward-compatible
-* endian-safe
-* corruption detectable
+- versioned
+- streamable
+- self-describing enough for restore
+- forward-compatible
+- endian-safe
+- corruption detectable
 
 Do not require seeking within the backup stream.
 
@@ -1238,12 +1238,12 @@ disaster recovery
 
 Design S3 layout so that:
 
-* listing snapshots is cheap
-* fetching a snapshot is cheap
-* old snapshots can be pruned
-* garbage collection does not require downloading every blob
-* object names are deterministic
-* repository metadata is small
+- listing snapshots is cheap
+- fetching a snapshot is cheap
+- old snapshots can be pruned
+- garbage collection does not require downloading every blob
+- object names are deterministic
+- repository metadata is small
 
 Use separate namespaces for:
 
@@ -1535,10 +1535,10 @@ Vec<u8>
 
 or equivalent structures that grow with:
 
-* database size
-* table size
-* snapshot size
-* S3 object size
+- database size
+- table size
+- snapshot size
+- S3 object size
 
 Memory should scale approximately with:
 
@@ -1576,12 +1576,12 @@ Default compression level must not consume a full CPU core unless the user expli
 
 Avoid:
 
-* excessive task scheduling
-* excessive hashing
-* unnecessary copies
-* repeated allocations
-* giant temporary buffers
-* aggressive polling
+- excessive task scheduling
+- excessive hashing
+- unnecessary copies
+- repeated allocations
+- giant temporary buffers
+- aggressive polling
 
 Prefer zero-copy or low-copy paths where practical.
 
@@ -1745,20 +1745,20 @@ Dumper handles credentials and potentially extremely sensitive data.
 
 Requirements:
 
-* never log passwords
-* never log secret keys
-* never expose credentials in panic messages
-* sanitize database URLs
-* sanitize S3 URLs
-* secure secret files
-* avoid writing credentials to disk
-* use TLS
-* authenticate repository contents
-* validate repository metadata
-* reject malformed input
-* prevent path traversal for local repositories
-* never execute shell commands
-* never require root
+- never log passwords
+- never log secret keys
+- never expose credentials in panic messages
+- sanitize database URLs
+- sanitize S3 URLs
+- secure secret files
+- avoid writing credentials to disk
+- use TLS
+- authenticate repository contents
+- validate repository metadata
+- reject malformed input
+- prevent path traversal for local repositories
+- never execute shell commands
+- never require root
 
 ---
 
@@ -2553,14 +2553,14 @@ Use idiomatic Rust.
 
 Avoid:
 
-* unnecessary `Arc`
-* unnecessary `Mutex`
-* excessive cloning
-* excessive heap allocation
-* giant enums where simpler representations work
-* unbounded channels
-* task-per-record designs
-* global mutable state
+- unnecessary `Arc`
+- unnecessary `Mutex`
+- excessive cloning
+- excessive heap allocation
+- giant enums where simpler representations work
+- unbounded channels
+- task-per-record designs
+- global mutable state
 
 Prefer:
 
@@ -2651,16 +2651,16 @@ COMPATIBILITY.md
 
 Document:
 
-* backup semantics
-* consistency model
-* encryption
-* S3 behavior
-* retention
-* crash recovery
-* memory behavior
-* CPU behavior
-* restore limitations
-* supported database versions
+- backup semantics
+- consistency model
+- encryption
+- S3 behavior
+- retention
+- crash recovery
+- memory behavior
+- CPU behavior
+- restore limitations
+- supported database versions
 
 ---
 
@@ -2688,16 +2688,16 @@ Do not oversell security.
 
 Before release:
 
-* audit dependencies
-* run `cargo audit`
-* run formatting/lints
-* test malformed repositories
-* test corrupted encrypted objects
-* test malformed S3 responses
-* test malicious metadata
-* test path traversal
-* test credential leakage in logs
-* test command-line process arguments where feasible
+- audit dependencies
+- run `cargo audit`
+- run formatting/lints
+- test malformed repositories
+- test corrupted encrypted objects
+- test malformed S3 responses
+- test malicious metadata
+- test path traversal
+- test credential leakage in logs
+- test command-line process arguments where feasible
 
 Do not claim production readiness until these have been exercised.
 
@@ -2931,15 +2931,15 @@ dumper prune
 
 The system passes only if:
 
-* backup is correct
-* restore is correct
-* data integrity is verified
-* previous snapshots survive failures
-* S3 is used without staging the entire backup locally
-* memory stays bounded
-* CPU usage is conservative
-* the application remains operational
-* the final container contains essentially only the Dumper binary and required CA certificates
+- backup is correct
+- restore is correct
+- data integrity is verified
+- previous snapshots survive failures
+- S3 is used without staging the entire backup locally
+- memory stays bounded
+- CPU usage is conservative
+- the application remains operational
+- the final container contains essentially only the Dumper binary and required CA certificates
 
 ---
 

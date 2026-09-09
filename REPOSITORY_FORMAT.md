@@ -20,7 +20,9 @@ Whether stored on local disk or in an S3 bucket, a Dumper repository has an iden
 ```
 
 ### 1.1 `config` Object
+
 The repository configuration contains encryption parameters and envelope key material:
+
 ```json
 {
   "format_version": 1,
@@ -34,7 +36,9 @@ The repository configuration contains encryption parameters and envelope key mat
 ```
 
 ### 1.2 `snapshots/<id>` Object
+
 Each snapshot is represented by an atomic JSON metadata file:
+
 ```json
 {
   "id": "7c4f9c3a",
@@ -65,16 +69,22 @@ Each snapshot is represented by an atomic JSON metadata file:
 ```
 
 ### 1.3 `blobs/<prefix>/<hash>`
+
 Each blob is an immutable, encrypted, compressed chunk:
+
 ```text
 [ Compression Tag (1B) | XChaCha20 Nonce (24B) | Ciphertext + Poly1305 Tag (N+16B) ]
 ```
+
 Compression tags:
+
 - `0x00`: Uncompressed
 - `0x01`: Zstandard
 
 ### 1.4 `locks/<lock_id>`
+
 Locks manage concurrent access:
+
 ```json
 {
   "lock_id": "3f8a10bc",
@@ -92,6 +102,7 @@ Locks manage concurrent access:
 The database backup stream is encoded in sequentially frame-delimited binary records. Seeking is never required for restore.
 
 ### Frame Layout
+
 ```text
 ┌──────────────┬────────────┬─────────────┬───────────┬──────────────┐
 │ Record Type  │   Flags    │ Payload Len │  Payload  │ CRC32 (LE)   │
@@ -100,14 +111,16 @@ The database backup stream is encoded in sequentially frame-delimited binary rec
 ```
 
 ### Stream Magic Header
+
 Every stream starts with the 4-byte sequence: `b"DMP1"` (`0x44 0x4D 0x50 0x31`).
 
 ### Record Types
-* `0x01` **Header**: Engine, database name, server version, start time.
-* `0x02` **PreData**: Schema creation, custom types, extensions.
-* `0x03` **TableSchema**: Column definitions, data types, nullability, CREATE TABLE DDL.
-* `0x04` **TableDataSlice**: Streamed table data slices (COPY binary or row batches).
-* `0x05` **Sequence**: Sequence state and current value.
-* `0x06` **PostData**: Secondary indexes, foreign keys, unique constraints.
-* `0x07` **Routine**: Views, functions, stored procedures, triggers.
-* `0xFF` **Trailer**: Total record count, total uncompressed bytes, stream SHA-256 hash.
+
+- `0x01` **Header**: Engine, database name, server version, start time.
+- `0x02` **PreData**: Schema creation, custom types, extensions.
+- `0x03` **TableSchema**: Column definitions, data types, nullability, CREATE TABLE DDL.
+- `0x04` **TableDataSlice**: Streamed table data slices (COPY binary or row batches).
+- `0x05` **Sequence**: Sequence state and current value.
+- `0x06` **PostData**: Secondary indexes, foreign keys, unique constraints.
+- `0x07` **Routine**: Views, functions, stored procedures, triggers.
+- `0xFF` **Trailer**: Total record count, total uncompressed bytes, stream SHA-256 hash.

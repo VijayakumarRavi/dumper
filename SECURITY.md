@@ -21,13 +21,13 @@ Dumper relies strictly on modern, standard, battle-tested cryptographic algorith
 
 ## Envelope Encryption & Key Management
 
-* The repository master key is a randomly generated 256-bit key.
-* The master key is wrapped using the Argon2id-derived KEK and stored in `config`.
-* **Key Rotation**: To change the repository password, only the `config` envelope is re-encrypted with a new KEK. Data blobs never need to be downloaded or re-encrypted.
-* **Plaintext Secrets**: Plaintext passwords and secret keys are never written to disk or stored in the repository.
+- The repository master key is a randomly generated 256-bit key.
+- The master key is wrapped using the Argon2id-derived KEK and stored in `config`.
+- **Key Rotation**: To change the repository password, only the `config` envelope is re-encrypted with a new KEK. Data blobs never need to be downloaded or re-encrypted.
+- **Plaintext Secrets**: Plaintext passwords and secret keys are never written to disk or stored in the repository.
 
 ## Credential Sanitization
 
-* All error messages, logs, and progress events run through `sanitize_secrets()`.
-* Connection strings (`postgres://user:pass@host/db`) have their password segments masked (`user:*****@host`).
-* AWS / S3 access keys and secret keys are never printed to terminal or standard error streams.
+- All error messages, logs, and progress events run through `sanitize_secrets()`.
+- Connection strings (`postgres://user:pass@host/db`) have their password segments masked (`user:*****@host`).
+- AWS / S3 access keys and secret keys are never printed to terminal or standard error streams.
