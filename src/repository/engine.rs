@@ -3,7 +3,7 @@ use crate::compression::{compress_data, decompress_data};
 use crate::crypto::aead::{decrypt_blob, encrypt_blob};
 use crate::error::DumperError;
 use crate::repository::backend::StorageBackend;
-use crate::repository::config::{RepositoryConfig, CONFIG_FILE_PATH};
+use crate::repository::config::{CONFIG_FILE_PATH, RepositoryConfig};
 use crate::repository::snapshot::{BlobReference, SnapshotMetadata};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -220,6 +220,9 @@ impl<B: StorageBackend> RepositoryEngine<B> {
             }
         }
 
+        // 3. Clean up abandoned temporary files (e.g. from interrupted uploads or crashes)
+        let _ = self.backend.cleanup_temp_files().await;
+
         Ok((deleted_count, deleted_bytes))
     }
 
@@ -259,7 +262,7 @@ impl<B: StorageBackend> RepositoryEngine<B> {
         let mut orphaned_count = 0;
 
         for blob_key in &all_blobs {
-            let hash = blob_key.split('/').last().unwrap_or("");
+            let hash = blob_key.split('/').next_back().unwrap_or("");
             if !referenced_hashes.contains(hash) {
                 orphaned_count += 1;
             }

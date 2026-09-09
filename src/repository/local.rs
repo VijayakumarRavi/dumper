@@ -54,26 +54,36 @@ impl StorageBackend for LocalBackend {
             .unwrap_or(&self.base_path)
             .join(&tmp_filename);
 
-        let mut file = File::create(&tmp_path).await.map_err(|e| {
-            DumperError::Repository(format!("Failed to create temp file {:?}: {}", tmp_path, e))
-        })?;
+        let write_res = async {
+            let mut file = File::create(&tmp_path).await.map_err(|e| {
+                DumperError::Repository(format!("Failed to create temp file {:?}: {}", tmp_path, e))
+            })?;
 
-        file.write_all(data).await.map_err(|e| {
-            DumperError::Repository(format!("Failed to write temp file {:?}: {}", tmp_path, e))
-        })?;
+            file.write_all(data).await.map_err(|e| {
+                DumperError::Repository(format!("Failed to write temp file {:?}: {}", tmp_path, e))
+            })?;
 
-        file.sync_all().await.map_err(|e| {
-            DumperError::Repository(format!("Failed to sync temp file {:?}: {}", tmp_path, e))
-        })?;
+            file.sync_all().await.map_err(|e| {
+                DumperError::Repository(format!("Failed to sync temp file {:?}: {}", tmp_path, e))
+            })?;
 
-        drop(file);
+            drop(file);
 
-        fs::rename(&tmp_path, &target_path).await.map_err(|e| {
-            DumperError::Repository(format!(
-                "Failed to rename temp file {:?} to {:?}: {}",
-                tmp_path, target_path, e
-            ))
-        })?;
+            fs::rename(&tmp_path, &target_path).await.map_err(|e| {
+                DumperError::Repository(format!(
+                    "Failed to rename temp file {:?} to {:?}: {}",
+                    tmp_path, target_path, e
+                ))
+            })?;
+
+            Ok::<(), DumperError>(())
+        }
+        .await;
+
+        if let Err(e) = write_res {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -161,6 +171,61 @@ impl StorageBackend for LocalBackend {
         results.sort();
         Ok(results)
     }
+
+    async fn count_temp_files(&self) -> Result<usize, DumperError> {
+        let mut count = 0;
+        let mut dirs = vec![self.base_path.clone()];
+        while let Some(dir) = dirs.pop() {
+            let mut entries = match fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            while let Some(entry) = entries.next_entry().await.map_err(|e| {
+                DumperError::Repository(format!("Failed to read directory {:?}: {}", dir, e))
+            })? {
+                let file_type = entry.file_type().await.map_err(|e| {
+                    DumperError::Repository(format!("Failed to inspect file type: {}", e))
+                })?;
+                let path = entry.path();
+                if file_type.is_dir() {
+                    dirs.push(path);
+                } else if file_type.is_file()
+                    && entry.file_name().to_string_lossy().starts_with(".tmp_")
+                {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    async fn cleanup_temp_files(&self) -> Result<usize, DumperError> {
+        let mut cleaned = 0;
+        let mut dirs = vec![self.base_path.clone()];
+        while let Some(dir) = dirs.pop() {
+            let mut entries = match fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            while let Some(entry) = entries.next_entry().await.map_err(|e| {
+                DumperError::Repository(format!("Failed to read directory {:?}: {}", dir, e))
+            })? {
+                let file_type = entry.file_type().await.map_err(|e| {
+                    DumperError::Repository(format!("Failed to inspect file type: {}", e))
+                })?;
+                let path = entry.path();
+                if file_type.is_dir() {
+                    dirs.push(path);
+                } else if file_type.is_file()
+                    && entry.file_name().to_string_lossy().starts_with(".tmp_")
+                    && fs::remove_file(&path).await.is_ok()
+                {
+                    cleaned += 1;
+                }
+            }
+        }
+        Ok(cleaned)
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +267,23 @@ mod tests {
         let malicious = "../../../etc/passwd";
         let res = backend.put_object(malicious, b"danger").await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_temp_file_counting_and_cleanup() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+
+        let sub_dir = temp_dir.path().join("blobs/ab");
+        fs::create_dir_all(&sub_dir).await.unwrap();
+
+        let tmp1 = sub_dir.join(".tmp_111");
+        let tmp2 = temp_dir.path().join(".tmp_222");
+        fs::write(&tmp1, b"partial").await.unwrap();
+        fs::write(&tmp2, b"partial").await.unwrap();
+
+        assert_eq!(backend.count_temp_files().await.unwrap(), 2);
+        assert_eq!(backend.cleanup_temp_files().await.unwrap(), 2);
+        assert_eq!(backend.count_temp_files().await.unwrap(), 0);
     }
 }

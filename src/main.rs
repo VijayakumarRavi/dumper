@@ -1,7 +1,7 @@
 use clap::Parser;
 use dumper::cli::{Cli, Commands};
 use dumper::database::{AnyDatabaseAdapter, RestoreOptions};
-use dumper::error::{sanitize_secrets, DumperError};
+use dumper::error::{DumperError, sanitize_secrets};
 use dumper::repository::backend::StorageBackend;
 use dumper::repository::engine::RepositoryEngine;
 use dumper::repository::local::LocalBackend;
@@ -12,11 +12,11 @@ use dumper::retention::evaluate_retention;
 use dumper::stats::{compute_stats, print_stats_table};
 use dumper::stream::decoder::StreamDecoder;
 use dumper::stream::encoder::StreamEncoder;
-use dumper::ui::progress::{format_bytes, format_duration, ProgressEvent, ProgressReporter};
+use dumper::ui::progress::{ProgressEvent, ProgressReporter, format_bytes, format_duration};
 use sha2::Digest;
 use std::io::{self, BufRead};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -482,11 +482,15 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
         Commands::Check => {
             reporter.log_info("Performing repository integrity check...");
             let (snapshots_count, missing, orphaned) = engine.check().await?;
+            let temp_count = backend.count_temp_files().await.unwrap_or(0);
 
             println!("Repository Integrity Check:");
-            println!("  Committed Snapshots: {}", snapshots_count);
-            println!("  Missing Blobs:       {}", missing);
-            println!("  Orphaned Blobs:      {}", orphaned);
+            println!("  Committed Snapshots:  {}", snapshots_count);
+            println!("  Missing Blobs:        {}", missing);
+            println!("  Orphaned Blobs:       {}", orphaned);
+            if temp_count > 0 {
+                println!("  Abandoned Temp Files: {}", temp_count);
+            }
 
             if missing > 0 {
                 return Err(DumperError::Integrity(format!(

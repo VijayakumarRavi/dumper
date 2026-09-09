@@ -27,4 +27,14 @@ pub trait StorageBackend: Send + Sync {
         &'a self,
         prefix: &'a str,
     ) -> impl Future<Output = Result<Vec<String>, DumperError>> + Send + 'a;
+    fn count_temp_files<'a>(
+        &'a self,
+    ) -> impl Future<Output = Result<usize, DumperError>> + Send + 'a {
+        async { Ok(0) }
+    }
+    fn cleanup_temp_files<'a>(
+        &'a self,
+    ) -> impl Future<Output = Result<usize, DumperError>> + Send + 'a {
+        async { Ok(0) }
+    }
 }

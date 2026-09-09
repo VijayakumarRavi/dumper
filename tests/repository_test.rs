@@ -1,4 +1,5 @@
 use dumper::cli::CompressionLevel;
+use dumper::repository::backend::StorageBackend;
 use dumper::repository::engine::RepositoryEngine;
 use dumper::repository::local::LocalBackend;
 use dumper::repository::snapshot::SnapshotMetadata;
@@ -249,6 +250,12 @@ async fn test_prune_does_not_download_blob_payloads() {
         ) -> Result<Vec<String>, dumper::error::DumperError> {
             self.inner.list_objects(prefix).await
         }
+        async fn count_temp_files<'a>(&'a self) -> Result<usize, dumper::error::DumperError> {
+            self.inner.count_temp_files().await
+        }
+        async fn cleanup_temp_files<'a>(&'a self) -> Result<usize, dumper::error::DumperError> {
+            self.inner.cleanup_temp_files().await
+        }
     }
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -330,4 +337,39 @@ async fn test_prune_does_not_download_blob_payloads() {
         1,
         "prune() should use lightweight get_object_size() instead"
     );
+}
+
+#[tokio::test]
+async fn test_abandoned_temp_files_cleanup_and_detection() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(LocalBackend::new(temp_dir.path()).await.unwrap());
+    let engine = RepositoryEngine::init(backend.clone(), "test-pass")
+        .await
+        .unwrap();
+
+    // 1. Manually create abandoned .tmp_* files inside blobs/ and snapshots/ simulating crashed operations
+    let blobs_dir = temp_dir.path().join("blobs");
+    let snaps_dir = temp_dir.path().join("snapshots");
+    tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+    tokio::fs::create_dir_all(&snaps_dir).await.unwrap();
+
+    let fake_tmp1 = blobs_dir.join(".tmp_1111_2222");
+    let fake_tmp2 = snaps_dir.join(".tmp_3333_4444");
+    tokio::fs::write(&fake_tmp1, b"abandoned partial blob data")
+        .await
+        .unwrap();
+    tokio::fs::write(&fake_tmp2, b"abandoned partial snapshot data")
+        .await
+        .unwrap();
+
+    // 2. Detection: backend count_temp_files must find both
+    assert_eq!(backend.count_temp_files().await.unwrap(), 2);
+
+    // 3. Prune: pruning the repository must clean up abandoned temporary files
+    let (_deleted_blobs, _freed) = engine.prune().await.unwrap();
+
+    // 4. Verify that temp files are now gone
+    assert_eq!(backend.count_temp_files().await.unwrap(), 0);
+    assert!(!fake_tmp1.exists());
+    assert!(!fake_tmp2.exists());
 }
