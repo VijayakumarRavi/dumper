@@ -63,7 +63,7 @@ pub fn evaluate_retention<'a>(
 
     for (_group_key, mut group_snapshots) in groups {
         // Sort group snapshots by started_at descending (most recent first)
-        group_snapshots.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        group_snapshots.sort_by_key(|b| std::cmp::Reverse(b.started_at));
 
         // 1. Keep Last N
         if let Some(n) = policy.keep_last {
@@ -77,11 +77,8 @@ pub fn evaluate_retention<'a>(
             let mut seen_days = BTreeSet::new();
             for s in &group_snapshots {
                 let day_key = s.started_at.format("%Y-%m-%d").to_string();
-                if seen_days.len() < n || seen_days.contains(&day_key) {
-                    if !seen_days.contains(&day_key) {
-                        seen_days.insert(day_key);
-                        kept_ids.insert(s.id.clone());
-                    }
+                if seen_days.len() < n && seen_days.insert(day_key) {
+                    kept_ids.insert(s.id.clone());
                 }
             }
         }
@@ -95,11 +92,8 @@ pub fn evaluate_retention<'a>(
                     s.started_at.year(),
                     s.started_at.iso_week().week()
                 );
-                if seen_weeks.len() < n || seen_weeks.contains(&week_key) {
-                    if !seen_weeks.contains(&week_key) {
-                        seen_weeks.insert(week_key);
-                        kept_ids.insert(s.id.clone());
-                    }
+                if seen_weeks.len() < n && seen_weeks.insert(week_key) {
+                    kept_ids.insert(s.id.clone());
                 }
             }
         }
@@ -109,11 +103,8 @@ pub fn evaluate_retention<'a>(
             let mut seen_months = BTreeSet::new();
             for s in &group_snapshots {
                 let month_key = s.started_at.format("%Y-%m").to_string();
-                if seen_months.len() < n || seen_months.contains(&month_key) {
-                    if !seen_months.contains(&month_key) {
-                        seen_months.insert(month_key);
-                        kept_ids.insert(s.id.clone());
-                    }
+                if seen_months.len() < n && seen_months.insert(month_key) {
+                    kept_ids.insert(s.id.clone());
                 }
             }
         }

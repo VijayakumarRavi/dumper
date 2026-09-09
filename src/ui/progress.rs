@@ -1,6 +1,6 @@
+use serde::Serialize;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
-use serde::Serialize;
 
 pub struct ProgressReporter {
     quiet: bool,

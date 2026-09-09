@@ -1,8 +1,8 @@
-use tokio::io::{AsyncRead, AsyncReadExt};
-use crc32fast::Hasher as CrcHasher;
 use crate::error::DumperError;
 use crate::stream::format::*;
+use crc32fast::Hasher as CrcHasher;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub struct StreamDecoder<R: AsyncRead + Unpin + Send> {
     reader: R,
@@ -31,7 +31,8 @@ impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
         if !self.magic_checked {
             let mut magic = [0u8; 4];
             self.reader
-                .read_exact(&mut magic).await
+                .read_exact(&mut magic)
+                .await
                 .map_err(|e| DumperError::Format(format!("Failed to read stream magic: {}", e)))?;
             if &magic != STREAM_MAGIC {
                 return Err(DumperError::Format(format!(
@@ -181,7 +182,8 @@ impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
                 if t.total_records != self.records_read - 1 {
                     return Err(DumperError::Integrity(format!(
                         "Stream total records mismatch: expected {}, calculated {}",
-                        t.total_records, self.records_read - 1
+                        t.total_records,
+                        self.records_read - 1
                     )));
                 }
                 self.trailer_verified = true;
@@ -221,7 +223,10 @@ mod tests {
                 dumper_version: "0.1.0".into(),
                 start_time: 1700000000,
             };
-            encoder.write_record(&StreamRecord::Header(header)).await.unwrap();
+            encoder
+                .write_record(&StreamRecord::Header(header))
+                .await
+                .unwrap();
 
             let schema = TableSchemaRecord {
                 schema_name: "public".into(),
@@ -234,7 +239,10 @@ mod tests {
                 }],
                 create_sql: "CREATE TABLE public.users (id integer NOT NULL);".into(),
             };
-            encoder.write_record(&StreamRecord::TableSchema(schema)).await.unwrap();
+            encoder
+                .write_record(&StreamRecord::TableSchema(schema))
+                .await
+                .unwrap();
 
             let data_slice = TableDataSliceRecord {
                 schema_name: "public".into(),
@@ -243,7 +251,10 @@ mod tests {
                 is_last: true,
                 data: vec![1, 2, 3, 4, 5, 6, 7, 8],
             };
-            encoder.write_record(&StreamRecord::TableDataSlice(data_slice)).await.unwrap();
+            encoder
+                .write_record(&StreamRecord::TableDataSlice(data_slice))
+                .await
+                .unwrap();
 
             encoder.finish().await.unwrap();
         }

@@ -1,7 +1,7 @@
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use crate::crypto::envelope::KeyEnvelope;
 use crate::error::DumperError;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 pub const REPO_FORMAT_VERSION: u32 = 1;
 pub const CONFIG_FILE_PATH: &str = "config";

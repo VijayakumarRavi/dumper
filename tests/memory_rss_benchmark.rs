@@ -11,7 +11,9 @@ async fn test_memory_bounded_streaming() {
         let mut buf = [0u8; 8192];
         let mut total = 0;
         while let Ok(n) = server.read(&mut buf).await {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             total += n;
         }
         // Ensure we actually processed a lot of data
@@ -19,13 +21,16 @@ async fn test_memory_bounded_streaming() {
     });
 
     let mut encoder = StreamEncoder::new(client);
-    
+
     // Write 50 MiB of data in chunks
     let chunk = vec![0u8; 1024 * 1024]; // 1 MiB chunk
     for _ in 0..55 {
-        encoder.write_raw_record(dumper::stream::format::RecordType::PreData, 0x00, &chunk).await.unwrap();
+        encoder
+            .write_raw_record(dumper::stream::format::RecordType::PreData, 0x00, &chunk)
+            .await
+            .unwrap();
     }
-    
+
     encoder.finish().await.unwrap();
     _server_task.await.unwrap();
     // If it OOMs or hangs, the test fails.

@@ -1,5 +1,5 @@
-use serde::Serialize;
 use crate::repository::s3::client::S3Client;
+use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct CompletedPart {
@@ -25,7 +25,8 @@ impl<'a> MultipartUploadSession<'a> {
     }
 
     pub fn add_completed_part(&mut self, part_number: usize, etag: String) {
-        self.completed_parts.push(CompletedPart { part_number, etag });
+        self.completed_parts
+            .push(CompletedPart { part_number, etag });
     }
 
     pub fn build_complete_xml(&self) -> String {

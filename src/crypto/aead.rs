@@ -1,9 +1,9 @@
+use crate::error::DumperError;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce,
 };
 use rand::{rngs::OsRng, RngCore};
-use crate::error::DumperError;
 
 pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
@@ -41,9 +41,11 @@ pub fn decrypt_blob(key: &[u8; 32], payload: &[u8]) -> Result<Vec<u8>, DumperErr
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| DumperError::Crypto(format!("Invalid cipher key: {}", e)))?;
 
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| DumperError::Integrity("Decryption failed: authentication tag mismatch or corrupted data".into()))?;
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        DumperError::Integrity(
+            "Decryption failed: authentication tag mismatch or corrupted data".into(),
+        )
+    })?;
 
     Ok(plaintext)
 }

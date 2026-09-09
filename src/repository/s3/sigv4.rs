@@ -1,7 +1,7 @@
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use chrono::{DateTime, Utc};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -75,23 +75,19 @@ impl<'a> SigV4Signer<'a> {
 
         let canonical_request = format!(
             "{}\n{}\n{}\n{}\n{}\n{}",
-            method,
-            safe_uri,
-            canonical_query,
-            canonical_headers,
-            signed_headers,
-            payload_hash
+            method, safe_uri, canonical_query, canonical_headers, signed_headers, payload_hash
         );
 
         let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
 
         // String to sign
-        let credential_scope = format!("{}/{}/{}/aws4_request", date_stamp, self.region, self.service);
+        let credential_scope = format!(
+            "{}/{}/{}/aws4_request",
+            date_stamp, self.region, self.service
+        );
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-            amz_date,
-            credential_scope,
-            canonical_request_hash
+            amz_date, credential_scope, canonical_request_hash
         );
 
         // Derive signing key
@@ -147,25 +143,25 @@ mod tests {
 
     #[test]
     fn test_sigv4_signing() {
-        let signer = SigV4Signer::new("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "us-east-1");
+        let signer = SigV4Signer::new(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+        );
         let now = DateTime::from_timestamp(1369353600, 0).unwrap(); // 2013-05-24T00:00:00Z
         let mut headers = BTreeMap::new();
         headers.insert("host".into(), "examplebucket.s3.amazonaws.com".into());
 
-        let (amz_date, payload_hash, auth) = signer.sign(
-            "GET",
-            "/test.txt",
-            &BTreeMap::new(),
-            &headers,
-            b"",
-            now,
-        );
+        let (amz_date, payload_hash, auth) =
+            signer.sign("GET", "/test.txt", &BTreeMap::new(), &headers, b"", now);
 
         assert_eq!(amz_date, "20130524T000000Z");
         assert_eq!(
             payload_hash,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"));
+        assert!(auth.starts_with(
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"
+        ));
     }
 }

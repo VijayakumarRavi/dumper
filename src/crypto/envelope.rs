@@ -42,11 +42,14 @@ impl KeyEnvelope {
             .map_err(|e| DumperError::Format(format!("Invalid encrypted master key hex: {}", e)))?;
 
         let kek = derive_key(password, &salt)?;
-        let decrypted = decrypt_blob(&kek, &encrypted_master)
-            .map_err(|_| DumperError::Authentication("Failed to unlock repository: incorrect password".into()))?;
+        let decrypted = decrypt_blob(&kek, &encrypted_master).map_err(|_| {
+            DumperError::Authentication("Failed to unlock repository: incorrect password".into())
+        })?;
 
         if decrypted.len() != KEY_LEN {
-            return Err(DumperError::Integrity("Decrypted master key has invalid length".into()));
+            return Err(DumperError::Integrity(
+                "Decrypted master key has invalid length".into(),
+            ));
         }
 
         let mut master_key = [0u8; KEY_LEN];
@@ -55,7 +58,11 @@ impl KeyEnvelope {
     }
 
     /// Rotate repository password without changing the underlying master key.
-    pub fn rotate_password(&mut self, current_password: &str, new_password: &str) -> Result<(), DumperError> {
+    pub fn rotate_password(
+        &mut self,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), DumperError> {
         let master_key = self.unlock(current_password)?;
         let new_salt = generate_salt();
         let new_kek = derive_key(new_password, &new_salt)?;
@@ -85,7 +92,9 @@ mod tests {
         assert!(failed.is_err());
 
         // Rotate password
-        envelope.rotate_password(password, "brand-new-password").unwrap();
+        envelope
+            .rotate_password(password, "brand-new-password")
+            .unwrap();
         assert!(envelope.unlock(password).is_err());
         let unlocked_new = envelope.unlock("brand-new-password").unwrap();
         assert_eq!(unlocked_new, master_key);

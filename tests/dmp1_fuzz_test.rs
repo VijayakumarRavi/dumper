@@ -37,7 +37,7 @@ async fn test_fuzz_oversized_payload() {
     data.extend_from_slice(&len.to_le_bytes());
 
     // Some random payload
-    data.extend_from_slice(&vec![0u8; 100]);
+    data.extend_from_slice(&[0u8; 100]);
 
     let mut decoder = StreamDecoder::new(data.as_slice());
     let res = decoder.read_next_record().await;

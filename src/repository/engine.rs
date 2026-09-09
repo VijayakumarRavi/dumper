@@ -3,7 +3,7 @@ use crate::compression::{compress_data, decompress_data};
 use crate::crypto::aead::{decrypt_blob, encrypt_blob};
 use crate::error::DumperError;
 use crate::repository::backend::StorageBackend;
-use crate::repository::config::{CONFIG_FILE_PATH, RepositoryConfig};
+use crate::repository::config::{RepositoryConfig, CONFIG_FILE_PATH};
 use crate::repository::snapshot::{BlobReference, SnapshotMetadata};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;

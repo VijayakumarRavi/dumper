@@ -605,12 +605,12 @@ impl DatabaseAdapter for PostgresAdapter {
         let mut tables_restored = 0;
         let mut records_processed = 0u64;
 
-        // Pending COPY sink handle
-        let mut active_copy_sink: Option<(
+        type ActiveCopySink = (
             String,
             String,
             std::pin::Pin<Box<tokio_postgres::CopyInSink<bytes::Bytes>>>,
-        )> = None;
+        );
+        let mut active_copy_sink: Option<ActiveCopySink> = None;
 
         while let Some(record) = decoder.read_next_record().await? {
             records_processed += 1;

@@ -11,8 +11,8 @@ pub struct BlobReference {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SnapshotMetadata {
-    pub id: String,          // Short 8-char identifier
-    pub full_id: String,     // Full SHA-256 identifier
+    pub id: String,      // Short 8-char identifier
+    pub full_id: String, // Full SHA-256 identifier
     pub format_version: u32,
     pub dumper_version: String,
     pub engine: String,

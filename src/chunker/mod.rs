@@ -1,6 +1,6 @@
+use crate::error::DumperError;
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use crate::error::DumperError;
 
 pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 
@@ -65,12 +65,14 @@ where
             let space = self.chunk_size - self.buffer.len();
             let to_take = (buf.len() - written).min(space);
 
-            self.buffer.extend_from_slice(&buf[written..written + to_take]);
+            self.buffer
+                .extend_from_slice(&buf[written..written + to_take]);
             written += to_take;
             self.total_bytes += to_take as u64;
 
             if self.buffer.len() >= self.chunk_size {
-                self.flush_chunk().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                self.flush_chunk()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
             }
         }
         Ok(written)

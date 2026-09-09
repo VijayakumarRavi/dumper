@@ -1,7 +1,7 @@
 use clap::Parser;
 use dumper::cli::{Cli, Commands};
 use dumper::database::{AnyDatabaseAdapter, RestoreOptions};
-use dumper::error::{DumperError, sanitize_secrets};
+use dumper::error::{sanitize_secrets, DumperError};
 use dumper::repository::backend::StorageBackend;
 use dumper::repository::engine::RepositoryEngine;
 use dumper::repository::local::LocalBackend;
@@ -12,11 +12,11 @@ use dumper::retention::evaluate_retention;
 use dumper::stats::{compute_stats, print_stats_table};
 use dumper::stream::decoder::StreamDecoder;
 use dumper::stream::encoder::StreamEncoder;
-use dumper::ui::progress::{ProgressEvent, ProgressReporter, format_bytes, format_duration};
+use dumper::ui::progress::{format_bytes, format_duration, ProgressEvent, ProgressReporter};
 use sha2::Digest;
 use std::io::{self, BufRead};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -208,7 +208,7 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                     let n = reader
                         .read(&mut buffer[chunk_bytes_read..])
                         .await
-                        .map_err(|e| DumperError::Io(e))?;
+                        .map_err(DumperError::Io)?;
                     if n == 0 {
                         if chunk_bytes_read > 0 {
                             let final_slice = &buffer[..chunk_bytes_read];
@@ -402,7 +402,7 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                     writer
                         .write_all(&chunk_bytes)
                         .await
-                        .map_err(|e| DumperError::Io(e))?;
+                        .map_err(DumperError::Io)?;
                 }
                 Ok::<_, DumperError>(())
             });
@@ -453,10 +453,7 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                     use tokio::io::AsyncWriteExt;
                     for b in &blobs {
                         let chunk = engine_clone.get_chunk(&b.hash).await?;
-                        writer
-                            .write_all(&chunk)
-                            .await
-                            .map_err(|e| DumperError::Io(e))?;
+                        writer.write_all(&chunk).await.map_err(DumperError::Io)?;
                     }
                     Ok::<_, DumperError>(())
                 });

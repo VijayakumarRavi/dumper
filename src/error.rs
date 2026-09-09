@@ -54,11 +54,15 @@ impl fmt::Display for DumperError {
                 write!(f, "Authentication error: {}", sanitize_secrets(msg))
             }
             DumperError::Database(msg) => write!(f, "Database error: {}", sanitize_secrets(msg)),
-            DumperError::Repository(msg) => write!(f, "Repository error: {}", sanitize_secrets(msg)),
+            DumperError::Repository(msg) => {
+                write!(f, "Repository error: {}", sanitize_secrets(msg))
+            }
             DumperError::S3(msg) => write!(f, "S3 storage error: {}", sanitize_secrets(msg)),
             DumperError::Crypto(msg) => write!(f, "Cryptography error: {}", sanitize_secrets(msg)),
             DumperError::Format(msg) => write!(f, "Format error: {}", sanitize_secrets(msg)),
-            DumperError::Integrity(msg) => write!(f, "Integrity verification error: {}", sanitize_secrets(msg)),
+            DumperError::Integrity(msg) => {
+                write!(f, "Integrity verification error: {}", sanitize_secrets(msg))
+            }
             DumperError::Restore(msg) => write!(f, "Restore error: {}", sanitize_secrets(msg)),
             DumperError::Interrupted => write!(f, "Operation interrupted by signal"),
             DumperError::Io(err) => write!(f, "I/O error: {}", sanitize_secrets(&err.to_string())),
@@ -99,7 +103,14 @@ pub fn sanitize_secrets(input: &str) -> String {
     }
 
     // Heuristic regex-like substitution for passwords in connection strings or keys
-    let schemes = ["postgres://", "postgresql://", "mysql://", "mariadb://", "http://", "https://"];
+    let schemes = [
+        "postgres://",
+        "postgresql://",
+        "mysql://",
+        "mariadb://",
+        "http://",
+        "https://",
+    ];
     for scheme in &schemes {
         if let Some(pos) = result.find(scheme) {
             let rest = &result[pos + scheme.len()..];
@@ -141,9 +152,18 @@ mod tests {
 
     #[test]
     fn test_exit_codes() {
-        assert_eq!(DumperError::Authentication("bad pass".into()).exit_code(), 3);
-        assert_eq!(DumperError::Database("connection failed".into()).exit_code(), 4);
-        assert_eq!(DumperError::Integrity("hash mismatch".into()).exit_code(), 6);
+        assert_eq!(
+            DumperError::Authentication("bad pass".into()).exit_code(),
+            3
+        );
+        assert_eq!(
+            DumperError::Database("connection failed".into()).exit_code(),
+            4
+        );
+        assert_eq!(
+            DumperError::Integrity("hash mismatch".into()).exit_code(),
+            6
+        );
         assert_eq!(DumperError::Interrupted.exit_code(), 8);
     }
 }

@@ -250,10 +250,10 @@ async fn test_prune_does_not_download_blob_payloads() {
         ) -> Result<Vec<String>, dumper::error::DumperError> {
             self.inner.list_objects(prefix).await
         }
-        async fn count_temp_files<'a>(&'a self) -> Result<usize, dumper::error::DumperError> {
+        async fn count_temp_files(&self) -> Result<usize, dumper::error::DumperError> {
             self.inner.count_temp_files().await
         }
-        async fn cleanup_temp_files<'a>(&'a self) -> Result<usize, dumper::error::DumperError> {
+        async fn cleanup_temp_files(&self) -> Result<usize, dumper::error::DumperError> {
             self.inner.cleanup_temp_files().await
         }
     }

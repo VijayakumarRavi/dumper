@@ -1,7 +1,7 @@
-use tokio::io::{AsyncWrite, AsyncRead};
 use crate::error::DumperError;
 use crate::stream::decoder::StreamDecoder;
 use crate::stream::encoder::StreamEncoder;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod mysql;
 pub mod postgres;
@@ -37,7 +37,9 @@ pub struct RestoreStats {
 }
 
 pub trait DatabaseAdapter: Send + Sync {
-    fn inspect(&self) -> impl std::future::Future<Output = Result<DatabaseMeta, DumperError>> + Send;
+    fn inspect(
+        &self,
+    ) -> impl std::future::Future<Output = Result<DatabaseMeta, DumperError>> + Send;
 
     fn backup<W: AsyncWrite + Unpin + Send>(
         &self,

@@ -1,6 +1,6 @@
+use crate::error::DumperError;
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::{rngs::OsRng, RngCore};
-use crate::error::DumperError;
 
 pub const SALT_LEN: usize = 16;
 pub const KEY_LEN: usize = 32;
@@ -15,7 +15,9 @@ pub fn generate_salt() -> [u8; SALT_LEN] {
 /// Designed to run comfortably within 32MB RAM containers.
 pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], DumperError> {
     if password.is_empty() {
-        return Err(DumperError::Authentication("Password cannot be empty".into()));
+        return Err(DumperError::Authentication(
+            "Password cannot be empty".into(),
+        ));
     }
 
     // Parameters: 32MB memory (32768 KB), 3 iterations, 1 lane

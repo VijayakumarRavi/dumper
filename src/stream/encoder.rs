@@ -1,8 +1,8 @@
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use crc32fast::Hasher as CrcHasher;
-use sha2::{Digest, Sha256};
 use crate::error::DumperError;
 use crate::stream::format::*;
+use crc32fast::Hasher as CrcHasher;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub struct StreamEncoder<W: AsyncWrite + Unpin + Send> {
     writer: W,
@@ -33,7 +33,12 @@ impl<W: AsyncWrite + Unpin + Send> StreamEncoder<W> {
         Ok(())
     }
 
-    pub async fn write_raw_record(&mut self, record_type: RecordType, flags: u8, payload: &[u8]) -> Result<(), DumperError> {
+    pub async fn write_raw_record(
+        &mut self,
+        record_type: RecordType,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<(), DumperError> {
         self.ensure_magic().await?;
 
         let mut crc_hasher = CrcHasher::new();
@@ -72,31 +77,38 @@ impl<W: AsyncWrite + Unpin + Send> StreamEncoder<W> {
             }
             StreamRecord::PreData(p) => {
                 let payload = serde_json::to_vec(p)?;
-                self.write_raw_record(RecordType::PreData, 0, &payload).await
+                self.write_raw_record(RecordType::PreData, 0, &payload)
+                    .await
             }
             StreamRecord::TableSchema(s) => {
                 let payload = serde_json::to_vec(s)?;
-                self.write_raw_record(RecordType::TableSchema, 0, &payload).await
+                self.write_raw_record(RecordType::TableSchema, 0, &payload)
+                    .await
             }
             StreamRecord::TableDataSlice(d) => {
                 let payload = serde_json::to_vec(d)?;
-                self.write_raw_record(RecordType::TableDataSlice, 0, &payload).await
+                self.write_raw_record(RecordType::TableDataSlice, 0, &payload)
+                    .await
             }
             StreamRecord::Sequence(s) => {
                 let payload = serde_json::to_vec(s)?;
-                self.write_raw_record(RecordType::Sequence, 0, &payload).await
+                self.write_raw_record(RecordType::Sequence, 0, &payload)
+                    .await
             }
             StreamRecord::PostData(p) => {
                 let payload = serde_json::to_vec(p)?;
-                self.write_raw_record(RecordType::PostData, 0, &payload).await
+                self.write_raw_record(RecordType::PostData, 0, &payload)
+                    .await
             }
             StreamRecord::Routine(r) => {
                 let payload = serde_json::to_vec(r)?;
-                self.write_raw_record(RecordType::Routine, 0, &payload).await
+                self.write_raw_record(RecordType::Routine, 0, &payload)
+                    .await
             }
             StreamRecord::Trailer(t) => {
                 let payload = serde_json::to_vec(t)?;
-                self.write_raw_record(RecordType::Trailer, 0, &payload).await
+                self.write_raw_record(RecordType::Trailer, 0, &payload)
+                    .await
             }
         }
     }

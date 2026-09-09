@@ -396,9 +396,9 @@ fn extract_xml_tags(xml: &str, tag: &str) -> Vec<String> {
             }
             Some('/') => {
                 // Self-closing: <tag/>
-                if after_start.starts_with("/>") {
+                if let Some(stripped) = after_start.strip_prefix("/>") {
                     results.push(String::new());
-                    cursor = &after_start[2..];
+                    cursor = stripped;
                 } else {
                     cursor = after_start;
                 }

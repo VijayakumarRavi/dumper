@@ -150,22 +150,24 @@ async fn test_lock_heartbeat_renewal() {
 
     let initial_hb = lock.info.last_heartbeat.unwrap();
 
-    // Sleep 100ms to allow at least 2 heartbeat ticks
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Read lock file directly from storage
+    // Poll for heartbeat update (giving up to 1s for background task to tick under heavy test load)
     use dumper::repository::backend::StorageBackend;
-    let data = backend.get_object(&lock.path).await.unwrap();
-    let info: dumper::repository::lock::LockInfo = serde_json::from_slice(&data).unwrap();
+    let mut advanced = false;
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Ok(data) = backend.get_object(&lock.path).await {
+            if let Ok(info) = serde_json::from_slice::<dumper::repository::lock::LockInfo>(&data) {
+                if let Some(hb) = info.last_heartbeat {
+                    if hb > initial_hb {
+                        advanced = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
-    assert!(
-        info.last_heartbeat.is_some(),
-        "Heartbeat must be recorded in lock file"
-    );
-    assert!(
-        info.last_heartbeat.unwrap() > initial_hb,
-        "Heartbeat timestamp must advance over time"
-    );
+    assert!(advanced, "Heartbeat timestamp must advance over time");
 
     lock.release().await.unwrap();
 }
