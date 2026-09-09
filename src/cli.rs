@@ -66,10 +66,18 @@ pub struct Cli {
     )]
     pub session_token: Option<String>,
 
-    #[arg(short = 'q', long = "quiet", help = "Quiet mode (suppress progress output)")]
+    #[arg(
+        short = 'q',
+        long = "quiet",
+        help = "Quiet mode (suppress progress output)"
+    )]
     pub quiet: bool,
 
-    #[arg(short = 'v', long = "verbose", help = "Verbose mode (more detailed diagnostic logs)")]
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        help = "Verbose mode (more detailed diagnostic logs)"
+    )]
     pub verbose: bool,
 
     #[arg(long = "json", help = "Emit machine-readable JSON output")]
@@ -143,7 +151,9 @@ pub enum Commands {
 
 #[derive(Args, Debug)]
 pub struct BackupArgs {
-    #[arg(help = "Database URL (postgres://user:pass@host:port/db or mysql://user:pass@host:port/db)")]
+    #[arg(
+        help = "Database URL (postgres://user:pass@host:port/db or mysql://user:pass@host:port/db)"
+    )]
     pub database_url: String,
 
     #[arg(long = "tag", help = "Optional user tag for snapshot metadata")]
@@ -187,30 +197,60 @@ pub struct VerifyArgs {
     pub restore_test: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct ForgetArgs {
     #[arg(long = "keep-last", help = "Keep the most recent N snapshots")]
     pub keep_last: Option<usize>,
 
-    #[arg(long = "keep-daily", help = "Keep 1 snapshot per day for the last N days with backups")]
+    #[arg(
+        long = "keep-daily",
+        help = "Keep 1 snapshot per day for the last N days with backups"
+    )]
     pub keep_daily: Option<usize>,
 
-    #[arg(long = "keep-weekly", help = "Keep 1 snapshot per week for the last N weeks with backups")]
+    #[arg(
+        long = "keep-weekly",
+        help = "Keep 1 snapshot per week for the last N weeks with backups"
+    )]
     pub keep_weekly: Option<usize>,
 
-    #[arg(long = "keep-monthly", help = "Keep 1 snapshot per month for the last N months with backups")]
+    #[arg(
+        long = "keep-monthly",
+        help = "Keep 1 snapshot per month for the last N months with backups"
+    )]
     pub keep_monthly: Option<usize>,
 
-    #[arg(long = "prune", help = "Automatically prune unreferenced blobs after forgetting")]
+    #[arg(
+        long = "database",
+        help = "Only apply retention policy to snapshots of this database"
+    )]
+    pub database: Option<String>,
+
+    #[arg(
+        long = "tag",
+        help = "Only apply retention policy to snapshots with this tag"
+    )]
+    pub tag: Option<String>,
+
+    #[arg(
+        long = "prune",
+        help = "Automatically prune unreferenced blobs after forgetting"
+    )]
     pub prune: bool,
 
-    #[arg(long = "dry-run", help = "Simulate retention without actually deleting snapshot records")]
+    #[arg(
+        long = "dry-run",
+        help = "Simulate retention without actually deleting snapshot records"
+    )]
     pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct StatsArgs {
-    #[arg(long = "full", help = "Scan all blob objects to compute exact storage size")]
+    #[arg(
+        long = "full",
+        help = "Scan all blob objects to compute exact storage size"
+    )]
     pub full: bool,
 }
 
