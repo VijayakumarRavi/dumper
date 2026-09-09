@@ -162,6 +162,23 @@ impl PostgresAdapter {
     async fn connect(&self) -> Result<Client, DumperError> {
         self.connect_with_db(None).await
     }
+
+    /// Queries `pg_stat_ssl` to verify whether the active connection is encrypted with TLS,
+    /// returning `(ssl_active, tls_version, tls_cipher)`.
+    pub async fn query_ssl_stat(&self) -> Result<(bool, Option<String>, Option<String>), DumperError> {
+        let client = self.connect().await?;
+        let row = client
+            .query_one(
+                "SELECT ssl, version, cipher FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .map_err(|e| DumperError::Database(format!("Failed to query pg_stat_ssl: {}", e)))?;
+        let ssl: bool = row.get(0);
+        let version: Option<String> = row.get(1);
+        let cipher: Option<String> = row.get(2);
+        Ok((ssl, version, cipher))
+    }
 }
 
 impl DatabaseAdapter for PostgresAdapter {

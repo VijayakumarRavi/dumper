@@ -616,15 +616,25 @@ async fn test_postgres_tls_rejection_on_sslmode_require() {
 
 #[tokio::test]
 async fn test_postgres_tls_success_roundtrip() {
+    let is_initdb_available = std::process::Command::new("initdb")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
     let pg = match TestPgServer::start_with_ssl() {
         Some(server) => server,
         None => {
-            eprintln!("PostgreSQL with SSL not available or failed to start, skipping test.");
-            return;
+            if is_initdb_available {
+                panic!("initdb is available but TestPgServer::start_with_ssl() failed to start SSL-enabled cluster");
+            } else {
+                eprintln!("PostgreSQL not installed, skipping test.");
+                return;
+            }
         }
     };
 
-    // 1. Verify that sslmode=require succeeds on SSL-enabled server
+    // 1. Verify that sslmode=require succeeds and actually establishes TLS encryption
     let target_db = "postgres_tls_test";
     assert!(pg.createdb(target_db));
 
@@ -633,6 +643,44 @@ async fn test_postgres_tls_success_roundtrip() {
         pg.port, target_db
     );
     let target_adapter = PostgresAdapter::new(&db_tls_url);
+
+    // Explicitly query pg_stat_ssl on the active backend connection
+    let (is_ssl, tls_ver, tls_cipher) = target_adapter
+        .query_ssl_stat()
+        .await
+        .expect("query_ssl_stat on sslmode=require connection");
+    assert!(
+        is_ssl,
+        "pg_stat_ssl.ssl must be true for sslmode=require connection"
+    );
+    assert!(
+        tls_ver.is_some(),
+        "pg_stat_ssl.version must be recorded for TLS connection"
+    );
+    assert!(
+        tls_cipher.is_some(),
+        "pg_stat_ssl.cipher must be recorded for TLS connection"
+    );
+    eprintln!(
+        "PROVEN: PostgreSQL TLS active: version={}, cipher={}",
+        tls_ver.as_deref().unwrap_or("unknown"),
+        tls_cipher.as_deref().unwrap_or("unknown")
+    );
+
+    // Verify unencrypted connection reports ssl = false
+    let db_plain_url = format!(
+        "postgres://postgres@127.0.0.1:{}/{}?sslmode=disable",
+        pg.port, target_db
+    );
+    let plain_adapter = PostgresAdapter::new(&db_plain_url);
+    let (plain_ssl, _, _) = plain_adapter
+        .query_ssl_stat()
+        .await
+        .expect("query_ssl_stat on sslmode=disable connection");
+    assert!(
+        !plain_ssl,
+        "pg_stat_ssl.ssl must be false for sslmode=disable connection"
+    );
 
     let stats_inspect = target_adapter.inspect().await.unwrap();
     assert_eq!(stats_inspect.database, target_db);
@@ -692,6 +740,27 @@ async fn test_postgres_tls_success_roundtrip() {
             .await
             .unwrap();
         assert_eq!(restore_stats.tables_restored, 1);
+    }
+
+    // Validate restored rows match original data exactly
+    {
+        let (client, conn) = tokio_postgres::connect(&setup_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let rows = client
+            .query("SELECT id, note FROM tls_data ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let r1_id: i32 = rows[0].get(0);
+        let r1_note: String = rows[0].get(1);
+        let r2_id: i32 = rows[1].get(0);
+        let r2_note: String = rows[1].get(1);
+        assert_eq!((r1_id, r1_note.as_str()), (1, "secure data"));
+        assert_eq!((r2_id, r2_note.as_str()), (2, "encrypted row"));
     }
 
     // 2. sslmode=verify-full must fail because self-signed certificate is not in WebPKI CA roots
