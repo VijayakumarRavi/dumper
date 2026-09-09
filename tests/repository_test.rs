@@ -113,3 +113,48 @@ async fn test_full_repository_lifecycle_and_deduplication() {
     let retrieved_c = engine.get_chunk(&hash_c).await.unwrap();
     assert_eq!(retrieved_c, block_c);
 }
+
+#[tokio::test]
+async fn test_prune_safety_on_corrupt_or_unreadable_snapshot() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(LocalBackend::new(temp_dir.path()).await.unwrap());
+    let engine = RepositoryEngine::init(backend.clone(), "test-pass").await.unwrap();
+
+    let block = b"Critical live table data";
+    let hash = hex::encode(Sha256::digest(block));
+    let (blob_ref, _) = engine.put_chunk(block, &hash, CompressionLevel::Default).await.unwrap();
+
+    let snap = SnapshotMetadata {
+        id: "snap_valid".into(),
+        full_id: "snap_valid_full".into(),
+        format_version: 1,
+        dumper_version: "0.1.0".into(),
+        engine: "postgresql".into(),
+        database: "prod".into(),
+        server_version: "17".into(),
+        started_at: chrono::Utc::now(),
+        completed_at: chrono::Utc::now(),
+        duration_seconds: 1,
+        logical_bytes: block.len() as u64,
+        stored_bytes: blob_ref.stored_size,
+        deduplicated_bytes: 0,
+        table_count: 1,
+        compression: "default".into(),
+        tag: None,
+        blobs: vec![blob_ref],
+    };
+    engine.commit_snapshot(&snap).await.unwrap();
+
+    // Intentionally create an unreadable / corrupted snapshot in the snapshots directory
+    use dumper::repository::backend::StorageBackend;
+    backend.put_object("snapshots/corrupt_snap", b"NOT_VALID_JSON").await.unwrap();
+
+    // prune() MUST abort with an error and must NOT delete any blobs!
+    let prune_res = engine.prune().await;
+    assert!(prune_res.is_err(), "prune() must fail when any snapshot cannot be parsed");
+
+    // Verify blob is still intact in storage
+    let fetched = engine.get_chunk(&hash).await.unwrap();
+    assert_eq!(fetched, block);
+}
+

@@ -155,14 +155,16 @@ impl<B: StorageBackend> RepositoryEngine<B> {
         let mut snapshots = Vec::new();
 
         for key in keys {
-            if let Ok(data) = self.backend.get_object(&key).await {
-                if let Ok(snapshot) = serde_json::from_slice::<SnapshotMetadata>(&data) {
-                    snapshots.push(snapshot);
-                }
-            }
+            let data = self.backend.get_object(&key).await.map_err(|e| {
+                DumperError::Repository(format!("Failed to read snapshot '{}': {}", key, e))
+            })?;
+            let snapshot = serde_json::from_slice::<SnapshotMetadata>(&data).map_err(|e| {
+                DumperError::Format(format!("Failed to parse snapshot metadata in '{}': {}", key, e))
+            })?;
+            snapshots.push(snapshot);
         }
 
-        snapshots.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        snapshots.sort_by_key(|b| std::cmp::Reverse(b.started_at));
         Ok(snapshots)
     }
 
