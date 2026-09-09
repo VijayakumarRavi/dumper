@@ -8,9 +8,22 @@ use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_postgres::{Client, NoTls};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub struct PostgresAdapter {
     url: String,
+}
+
+fn create_rustls_connector() -> MakeRustlsConnect {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("valid TLS protocol versions")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    MakeRustlsConnect::new(client_config)
 }
 
 impl PostgresAdapter {
@@ -20,19 +33,71 @@ impl PostgresAdapter {
         }
     }
 
-    async fn connect(&self) -> Result<Client, DumperError> {
-        let (client, connection) = tokio_postgres::connect(&self.url, NoTls)
-            .await
-            .map_err(|e| DumperError::Database(format!("PostgreSQL connection failed: {}", e)))?;
+    async fn connect_with_db(&self, db_override: Option<&str>) -> Result<Client, DumperError> {
+        let mut config: tokio_postgres::Config = self.url.parse().map_err(|e| {
+            DumperError::Database(format!(
+                "Invalid PostgreSQL connection URL '{}': {}",
+                self.url, e
+            ))
+        })?;
 
-        // Spawn connection runner in background
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("PostgreSQL connection error: {}", e);
+        if let Some(target_db) = db_override {
+            config.dbname(target_db);
+        }
+
+        let ssl_mode = config.get_ssl_mode();
+        let client = if ssl_mode == tokio_postgres::config::SslMode::Disable {
+            let (client, connection) = config.connect(NoTls).await.map_err(|e| {
+                DumperError::Database(format!("PostgreSQL connection failed: {}", e))
+            })?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("PostgreSQL connection error: {}", e);
+                }
+            });
+            client
+        } else {
+            let tls = create_rustls_connector();
+            match config.connect(tls).await {
+                Ok((client, connection)) => {
+                    tokio::spawn(async move {
+                        if let Err(e) = connection.await {
+                            eprintln!("PostgreSQL connection error: {}", e);
+                        }
+                    });
+                    client
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if ssl_mode != tokio_postgres::config::SslMode::Require
+                        && (err_str.contains("server does not support TLS")
+                            || err_str.contains("SSL is not supported")
+                            || err_str.contains("server does not support SSL"))
+                    {
+                        let (client, connection) = config.connect(NoTls).await.map_err(|e| {
+                            DumperError::Database(format!("PostgreSQL connection failed: {}", e))
+                        })?;
+                        tokio::spawn(async move {
+                            if let Err(e) = connection.await {
+                                eprintln!("PostgreSQL connection error: {}", e);
+                            }
+                        });
+                        client
+                    } else {
+                        return Err(DumperError::Database(format!(
+                            "PostgreSQL TLS connection failed: {}",
+                            e
+                        )));
+                    }
+                }
             }
-        });
+        };
 
         Ok(client)
+    }
+
+    async fn connect(&self) -> Result<Client, DumperError> {
+        self.connect_with_db(None).await
     }
 }
 
@@ -533,7 +598,9 @@ impl DatabaseAdapter for PostgresAdapter {
         decoder: &mut StreamDecoder<R>,
         options: &RestoreOptions,
     ) -> Result<RestoreStats, DumperError> {
-        let client = self.connect().await?;
+        let client = self
+            .connect_with_db(options.target_database_override.as_deref())
+            .await?;
 
         let mut tables_restored = 0;
         let mut records_processed = 0u64;
@@ -628,6 +695,9 @@ impl DatabaseAdapter for PostgresAdapter {
                                         e
                                     ))
                                 })?;
+                            sink.as_mut().flush().await.map_err(|e| {
+                                DumperError::Restore(format!("COPY IN flush failed: {}", e))
+                            })?;
                         }
                     }
 

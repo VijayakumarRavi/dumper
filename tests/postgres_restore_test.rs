@@ -6,6 +6,8 @@ use dumper::stream::format::*;
 use std::process::Command;
 use tempfile::TempDir;
 
+static PG_PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
 struct TestPgServer {
     dir: TempDir,
     port: u16,
@@ -15,7 +17,8 @@ impl TestPgServer {
     fn start() -> Option<Self> {
         let dir = TempDir::new().ok()?;
         let path = dir.path().to_str()?;
-        let port = 54300 + (std::process::id() % 1000) as u16;
+        let offset = PG_PORT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = 54300 + ((std::process::id() as u16 % 200) * 10) + offset;
 
         let init_status = Command::new("initdb")
             .args(["-D", path, "--no-sync", "-A", "trust", "-U", "postgres"])
@@ -48,6 +51,22 @@ impl TestPgServer {
 
     fn url(&self) -> String {
         format!("postgres://postgres@127.0.0.1:{}/postgres", self.port)
+    }
+
+    fn createdb(&self, dbname: &str) -> bool {
+        Command::new("createdb")
+            .args([
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &self.port.to_string(),
+                "-U",
+                "postgres",
+                dbname,
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
 
@@ -371,4 +390,149 @@ async fn test_postgres_sequence_and_serial_restoration_roundtrip() {
             "Standalone sequence must resume with correct increment and state"
         );
     }
+}
+
+#[tokio::test]
+async fn test_postgres_restore_target_database_override() {
+    let pg = match TestPgServer::start() {
+        Some(server) => server,
+        None => {
+            eprintln!("PostgreSQL not available or failed to start, skipping test.");
+            return;
+        }
+    };
+
+    assert!(pg.createdb("staging_db"), "Failed to create staging_db");
+
+    let adapter = PostgresAdapter::new(&pg.url());
+
+    // Construct a backup stream with table 'products'
+    let mut buffer = Vec::new();
+    {
+        let mut encoder = StreamEncoder::new(&mut buffer);
+
+        let header = StreamHeader {
+            version: 1,
+            engine: "postgresql".into(),
+            database: "postgres".into(),
+            server_version: "18".into(),
+            dumper_version: "0.1.0".into(),
+            start_time: 1700000000,
+        };
+        encoder
+            .write_record(&StreamRecord::Header(header))
+            .await
+            .unwrap();
+
+        let schema = TableSchemaRecord {
+            schema_name: "public".into(),
+            table_name: "products".into(),
+            columns: vec![
+                TableColumnMeta {
+                    name: "id".into(),
+                    data_type: "integer".into(),
+                    is_nullable: false,
+                    default_val: None,
+                },
+                TableColumnMeta {
+                    name: "name".into(),
+                    data_type: "text".into(),
+                    is_nullable: true,
+                    default_val: None,
+                },
+            ],
+            create_sql: "CREATE TABLE public.products (id integer PRIMARY KEY, name text);".into(),
+        };
+        encoder
+            .write_record(&StreamRecord::TableSchema(schema))
+            .await
+            .unwrap();
+
+        encoder.finish().await.unwrap();
+    }
+
+    let mut decoder = StreamDecoder::new(&buffer[..]);
+    let options = RestoreOptions {
+        target_database_override: Some("staging_db".into()),
+        drop_existing: true,
+    };
+
+    let stats = adapter.restore(&mut decoder, &options).await.unwrap();
+    assert_eq!(stats.tables_restored, 1);
+
+    // Verify staging_db has the products table
+    let staging_url = format!("postgres://postgres@127.0.0.1:{}/staging_db", pg.port);
+    let (staging_client, conn) = tokio_postgres::connect(&staging_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let row = staging_client
+        .query_one("SELECT to_regclass('public.products')::text;", &[])
+        .await
+        .unwrap();
+    let regclass: Option<String> = row.get(0);
+    assert_eq!(regclass.as_deref(), Some("products"));
+
+    // Verify default postgres database does NOT have the products table
+    let (default_client, conn2) = tokio_postgres::connect(&pg.url(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn2.await;
+    });
+    let row_default = default_client
+        .query_one("SELECT to_regclass('public.products')::text;", &[])
+        .await
+        .unwrap();
+    let regclass_default: Option<String> = row_default.get(0);
+    assert_eq!(
+        regclass_default, None,
+        "Original database must not receive restored table when target_database_override is set"
+    );
+}
+
+#[tokio::test]
+async fn test_postgres_tls_rejection_on_sslmode_require() {
+    let pg = match TestPgServer::start() {
+        Some(server) => server,
+        None => {
+            eprintln!("PostgreSQL not available or failed to start, skipping test.");
+            return;
+        }
+    };
+
+    // 1. sslmode=require must fail because local test server does not have SSL enabled
+    let require_url = format!("{}?sslmode=require", pg.url());
+    let require_adapter = PostgresAdapter::new(&require_url);
+    let require_res = require_adapter.inspect().await;
+    assert!(
+        require_res.is_err(),
+        "sslmode=require must fail on non-SSL server"
+    );
+    let err = require_res.unwrap_err().to_string();
+    assert!(
+        err.contains("PostgreSQL TLS connection failed")
+            || err.contains("server does not support TLS"),
+        "Error must indicate TLS failure: {}",
+        err
+    );
+
+    // 2. sslmode=disable must succeed
+    let disable_url = format!("{}?sslmode=disable", pg.url());
+    let disable_adapter = PostgresAdapter::new(&disable_url);
+    assert!(
+        disable_adapter.inspect().await.is_ok(),
+        "sslmode=disable must succeed on non-SSL server"
+    );
+
+    // 3. sslmode=prefer must gracefully fall back to NoTls on non-SSL server
+    let prefer_url = format!("{}?sslmode=prefer", pg.url());
+    let prefer_adapter = PostgresAdapter::new(&prefer_url);
+    assert!(
+        prefer_adapter.inspect().await.is_ok(),
+        "sslmode=prefer must succeed on non-SSL server"
+    );
 }
