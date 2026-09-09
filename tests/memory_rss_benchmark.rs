@@ -23,10 +23,10 @@ async fn test_memory_bounded_streaming() {
     // Write 50 MiB of data in chunks
     let chunk = vec![0u8; 1024 * 1024]; // 1 MiB chunk
     for _ in 0..55 {
-        encoder.write_record(0x02, 0x00, &chunk).await.unwrap();
+        encoder.write_raw_record(dumper::stream::format::RecordType::PreData, 0x00, &chunk).await.unwrap();
     }
     
-    encoder.finalize().await.unwrap();
-    
+    encoder.finish().await.unwrap();
+    _server_task.await.unwrap();
     // If it OOMs or hangs, the test fails.
 }
