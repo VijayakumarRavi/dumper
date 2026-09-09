@@ -118,7 +118,11 @@ impl S3Client {
             let parsed_endpoint = url::Url::parse(&self.endpoint)
                 .map_err(|e| DumperError::S3(format!("Invalid endpoint URL: {}", e)))?;
             let host = parsed_endpoint.host_str().unwrap_or("s3.amazonaws.com");
-            headers.insert("host".into(), host.to_string());
+            let host_header = match parsed_endpoint.port() {
+                Some(port) => format!("{}:{}", host, port),
+                None => host.to_string(),
+            };
+            headers.insert("host".into(), host_header.clone());
 
             if let Some(ref token) = self.session_token {
                 headers.insert("x-amz-security-token".into(), token.clone());
@@ -139,6 +143,7 @@ impl S3Client {
             let mut req = self
                 .client
                 .request(method.clone(), &request_url)
+                .header("host", host_header)
                 .header("x-amz-date", amz_date)
                 .header("x-amz-content-sha256", payload_hash)
                 .header("Authorization", auth);
