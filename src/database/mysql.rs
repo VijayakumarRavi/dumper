@@ -393,15 +393,24 @@ impl DatabaseAdapter for MysqlAdapter {
                                 .collect::<Vec<_>>()
                                 .join(", ");
                             let insert_sql = format!("{} ({});", insert_prefix, values_str);
-                            let _ = conn.query_drop(&insert_sql).await;
+                            conn.query_drop(&insert_sql).await.map_err(|e| {
+                                DumperError::Restore(format!(
+                                    "Failed to insert row into table '{}': {}",
+                                    d.table_name, e
+                                ))
+                            })?;
                         }
                     }
                 }
                 StreamRecord::PostData(p) => {
-                    let _ = conn.query_drop(&p.sql).await;
+                    conn.query_drop(&p.sql).await.map_err(|e| {
+                        DumperError::Restore(format!("Failed to execute post-data in MySQL: {}", e))
+                    })?;
                 }
                 StreamRecord::Routine(r) => {
-                    let _ = conn.query_drop(&r.sql).await;
+                    conn.query_drop(&r.sql).await.map_err(|e| {
+                        DumperError::Restore(format!("Failed to create routine/view '{}' in MySQL: {}", r.name, e))
+                    })?;
                 }
                 StreamRecord::Trailer(_) => break,
                 _ => {}

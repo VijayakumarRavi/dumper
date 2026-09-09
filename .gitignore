@@ -2,3 +2,4 @@
 .direnv/
 .envrc.cache
 **/*.tmp_*
+/data/
