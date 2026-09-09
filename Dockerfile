@@ -8,7 +8,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 ENV RUSTFLAGS="-C target-feature=+crt-static"
-RUN cargo build --release --target x86_64-unknown-linux-musl || cargo build --release
+RUN (cargo build --release --target x86_64-unknown-linux-musl && cp target/x86_64-unknown-linux-musl/release/dumper /build/dumper) || \
+    (cargo build --release && cp target/release/dumper /build/dumper)
 
 # Stage 2: Ultra-minimal scratch container
 FROM scratch
@@ -17,7 +18,7 @@ FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
 # Copy statically-linked dumper executable
-COPY --from=builder /build/target/*/release/dumper /dumper
+COPY --from=builder /build/dumper /dumper
 
 # Run as unprivileged non-root user
 USER 65532:65532
