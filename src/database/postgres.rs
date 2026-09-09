@@ -172,6 +172,38 @@ impl DatabaseAdapter for PostgresAdapter {
                 .await?;
         }
 
+        // 3.6 Sequence Definitions
+        let seq_ddl_rows = client
+            .query(
+                "SELECT schemaname, sequencename, \
+                 'CREATE SEQUENCE IF NOT EXISTS \"' || schemaname || '\".\"' || sequencename || '\"' || \
+                 ' AS ' || data_type || \
+                 ' INCREMENT BY ' || increment_by || \
+                 ' MINVALUE ' || min_value || \
+                 ' MAXVALUE ' || max_value || \
+                 ' START WITH ' || start_value || \
+                 CASE WHEN cycle THEN ' CYCLE' ELSE ' NO CYCLE' END || \
+                 ' CACHE ' || cache_size || ';' \
+                 FROM pg_sequences \
+                 WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY schemaname, sequencename",
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        for srow in seq_ddl_rows {
+            let schema: String = srow.get(0);
+            let seq: String = srow.get(1);
+            let sql: String = srow.get(2);
+            encoder
+                .write_record(&StreamRecord::PreData(PreDataRecord {
+                    name: format!("{}.{}", schema, seq),
+                    sql,
+                }))
+                .await?;
+        }
+
         // 4. Tables and Streaming COPY Data
         let mut tables_backed_up = 0;
         let total_rows = 0u64;
@@ -301,18 +333,22 @@ impl DatabaseAdapter for PostgresAdapter {
                 "SELECT last_value, is_called FROM \"{}\".\"{}\"",
                 schema, seq
             );
-            if let Ok(val_row) = client.query_one(&seq_val_sql, &[]).await {
-                let last_value: i64 = val_row.get(0);
-                let is_called: bool = val_row.get(1);
-                encoder
-                    .write_record(&StreamRecord::Sequence(SequenceRecord {
-                        schema_name: schema,
-                        sequence_name: seq,
-                        last_value,
-                        is_called,
-                    }))
-                    .await?;
-            }
+            let val_row = client.query_one(&seq_val_sql, &[]).await.map_err(|e| {
+                DumperError::Database(format!(
+                    "Failed to query sequence {}.{}: {}",
+                    schema, seq, e
+                ))
+            })?;
+            let last_value: i64 = val_row.get(0);
+            let is_called: bool = val_row.get(1);
+            encoder
+                .write_record(&StreamRecord::Sequence(SequenceRecord {
+                    schema_name: schema,
+                    sequence_name: seq,
+                    last_value,
+                    is_called,
+                }))
+                .await?;
         }
 
         // 6. Views & Materialized Views
@@ -534,6 +570,18 @@ impl DatabaseAdapter for PostgresAdapter {
                         );
                         let _ = client.batch_execute(&drop_sql).await;
                     }
+
+                    // Pre-create any sequences referenced in column defaults to avoid relation does not exist error
+                    for col in &s.columns {
+                        if let Some(ref default_expr) = col.default_val {
+                            if let Some(create_seq_sql) =
+                                extract_sequence_from_default(default_expr, &s.schema_name)
+                            {
+                                let _ = client.batch_execute(&create_seq_sql).await;
+                            }
+                        }
+                    }
+
                     client.batch_execute(&s.create_sql).await.map_err(|e| {
                         let msg = if let Some(d) = e.as_db_error() {
                             format!("{}: {}", d.message(), d.detail().unwrap_or(""))
@@ -595,14 +643,19 @@ impl DatabaseAdapter for PostgresAdapter {
                     }
                 }
                 StreamRecord::Sequence(seq) => {
-                    let setval_sql = format!(
-                        "SELECT setval('\"{}\".\"{}\"', {}, {});",
-                        seq.schema_name, seq.sequence_name, seq.last_value, seq.is_called
+                    let seq_sql = format!(
+                        "CREATE SEQUENCE IF NOT EXISTS \"{}\".\"{}\"; SELECT setval('\"{}\".\"{}\"', {}, {});",
+                        seq.schema_name, seq.sequence_name, seq.schema_name, seq.sequence_name, seq.last_value, seq.is_called
                     );
-                    client.batch_execute(&setval_sql).await.map_err(|e| {
+                    client.batch_execute(&seq_sql).await.map_err(|e| {
+                        let msg = if let Some(d) = e.as_db_error() {
+                            format!("{}: {}", d.message(), d.detail().unwrap_or(""))
+                        } else {
+                            e.to_string()
+                        };
                         DumperError::Restore(format!(
-                            "Failed to update sequence {}.{}: {}",
-                            seq.schema_name, seq.sequence_name, e
+                            "Failed to create and set sequence {}.{}: {}",
+                            seq.schema_name, seq.sequence_name, msg
                         ))
                     })?;
                 }
@@ -632,5 +685,28 @@ impl DatabaseAdapter for PostgresAdapter {
             tables_restored,
             records_processed,
         })
+    }
+}
+
+fn extract_sequence_from_default(default_expr: &str, default_schema: &str) -> Option<String> {
+    let start = default_expr.find("nextval('")?;
+    let rest = &default_expr[start + 9..];
+    let end = rest.find('\'')?;
+    let seq_ref = &rest[..end];
+
+    if seq_ref.contains('.') {
+        let parts: Vec<&str> = seq_ref.splitn(2, '.').collect();
+        let s = parts[0].trim_matches('"');
+        let q = parts[1].trim_matches('"');
+        Some(format!(
+            "CREATE SEQUENCE IF NOT EXISTS \"{}\".\"{}\";",
+            s, q
+        ))
+    } else {
+        let q = seq_ref.trim_matches('"');
+        Some(format!(
+            "CREATE SEQUENCE IF NOT EXISTS \"{}\".\"{}\";",
+            default_schema, q
+        ))
     }
 }

@@ -268,3 +268,107 @@ async fn test_postgres_custom_types_and_precision_preserved() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_postgres_sequence_and_serial_restoration_roundtrip() {
+    let pg = match TestPgServer::start() {
+        Some(server) => server,
+        None => {
+            eprintln!("PostgreSQL not available or failed to start, skipping test.");
+            return;
+        }
+    };
+
+    let adapter = PostgresAdapter::new(&pg.url());
+
+    // Setup source schema with serial column and a standalone sequence
+    {
+        let (client, conn) = tokio_postgres::connect(&pg.url(), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .batch_execute(
+                "
+                CREATE TABLE orders (
+                    id serial PRIMARY KEY,
+                    description text NOT NULL
+                );
+                INSERT INTO orders (description) VALUES ('Item A'), ('Item B'), ('Item C');
+                CREATE SEQUENCE global_tx_seq START WITH 100 INCREMENT BY 5;
+                SELECT nextval('global_tx_seq');
+            ",
+            )
+            .await
+            .unwrap();
+    }
+
+    // Backup
+    let mut buffer = Vec::new();
+    {
+        let mut encoder = StreamEncoder::new(&mut buffer);
+        let stats = adapter.backup(&mut encoder).await.unwrap();
+        assert_eq!(stats.tables_backed_up, 1);
+        encoder.finish().await.unwrap();
+    }
+
+    // Drop table and standalone sequence
+    {
+        let (client, conn) = tokio_postgres::connect(&pg.url(), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .batch_execute("DROP TABLE orders CASCADE; DROP SEQUENCE IF EXISTS global_tx_seq;")
+            .await
+            .unwrap();
+    }
+
+    // Restore
+    let mut decoder = StreamDecoder::new(&buffer[..]);
+    let options = RestoreOptions {
+        target_database_override: None,
+        drop_existing: true,
+    };
+    let restore_stats = adapter.restore(&mut decoder, &options).await.unwrap();
+    assert_eq!(restore_stats.tables_restored, 1);
+
+    // Verify restored serial sequence behavior and standalone sequence
+    {
+        let (client, conn) = tokio_postgres::connect(&pg.url(), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // Insert new order without specifying id; serial must assign 4
+        let row = client
+            .query_one(
+                "INSERT INTO orders (description) VALUES ('Item D') RETURNING id;",
+                &[],
+            )
+            .await
+            .unwrap();
+        let new_id: i32 = row.get(0);
+        assert_eq!(
+            new_id, 4,
+            "Serial sequence must resume at 4 after 3 initial rows"
+        );
+
+        // Check standalone sequence nextval; previous was 100, increment is 5, next must be 105
+        let seq_row = client
+            .query_one("SELECT nextval('global_tx_seq');", &[])
+            .await
+            .unwrap();
+        let next_val: i64 = seq_row.get(0);
+        assert_eq!(
+            next_val, 105,
+            "Standalone sequence must resume with correct increment and state"
+        );
+    }
+}
