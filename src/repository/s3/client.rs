@@ -81,6 +81,25 @@ impl S3Client {
         }
     }
 
+    pub(crate) fn build_canonical_uri(&self, key: &str) -> String {
+        let clean_key = key.trim_start_matches('/');
+        if clean_key.is_empty() {
+            format!("/{}", self.bucket)
+        } else {
+            format!("/{}/{}", self.bucket, clean_key)
+        }
+    }
+
+    pub(crate) fn build_request_url(&self, key: &str) -> String {
+        let endpoint = self.endpoint.trim_end_matches('/');
+        let clean_key = key.trim_start_matches('/');
+        if clean_key.is_empty() {
+            format!("{}/{}", endpoint, self.bucket)
+        } else {
+            format!("{}/{}/{}", endpoint, self.bucket, clean_key)
+        }
+    }
+
     async fn send_request_with_retry(
         &self,
         method: Method,
@@ -93,7 +112,7 @@ impl S3Client {
 
         for attempt in 0..=max_retries {
             let now = Utc::now();
-            let canonical_uri = format!("/{}/{}", self.bucket, key);
+            let canonical_uri = self.build_canonical_uri(key);
 
             let mut headers = BTreeMap::new();
             let parsed_endpoint = url::Url::parse(&self.endpoint)
@@ -115,11 +134,7 @@ impl S3Client {
                 now,
             );
 
-            let mut request_url = format!("{}/{}", self.endpoint, self.bucket);
-            if !key.is_empty() {
-                request_url.push('/');
-                request_url.push_str(key);
-            }
+            let request_url = self.build_request_url(key);
 
             let mut req = self
                 .client
@@ -379,5 +394,70 @@ mod tests {
         assert_eq!(keys, vec!["blobs/ab/1234", "blobs/cd/5678"]);
         let tokens = extract_xml_tags(xml, "NextContinuationToken");
         assert_eq!(tokens, vec!["token_xyz"]);
+    }
+
+    #[test]
+    fn test_canonical_uri_and_request_url_alignment() {
+        let client = S3Client::new(
+            Some("https://s3.amazonaws.com".into()),
+            "my-backups".into(),
+            "prod".into(),
+            "us-east-1".into(),
+            "test_access".into(),
+            "test_secret".into(),
+            None,
+        )
+        .unwrap();
+
+        // 1. Empty key (used by list_objects)
+        let empty_canon = client.build_canonical_uri("");
+        let empty_url = client.build_request_url("");
+        assert_eq!(empty_canon, "/my-backups");
+        assert_eq!(empty_url, "https://s3.amazonaws.com/my-backups");
+        let parsed_empty = url::Url::parse(&empty_url).unwrap();
+        assert_eq!(parsed_empty.path(), empty_canon);
+
+        // 2. Slash key
+        let slash_canon = client.build_canonical_uri("/");
+        let slash_url = client.build_request_url("/");
+        assert_eq!(slash_canon, "/my-backups");
+        assert_eq!(slash_url, "https://s3.amazonaws.com/my-backups");
+        let parsed_slash = url::Url::parse(&slash_url).unwrap();
+        assert_eq!(parsed_slash.path(), slash_canon);
+
+        // 3. Object key
+        let obj_canon = client.build_canonical_uri("blobs/ab/1234");
+        let obj_url = client.build_request_url("blobs/ab/1234");
+        assert_eq!(obj_canon, "/my-backups/blobs/ab/1234");
+        assert_eq!(obj_url, "https://s3.amazonaws.com/my-backups/blobs/ab/1234");
+        let parsed_obj = url::Url::parse(&obj_url).unwrap();
+        assert_eq!(parsed_obj.path(), obj_canon);
+
+        // 4. Object key with leading slash
+        let leading_slash_canon = client.build_canonical_uri("/blobs/ab/1234");
+        let leading_slash_url = client.build_request_url("/blobs/ab/1234");
+        assert_eq!(leading_slash_canon, "/my-backups/blobs/ab/1234");
+        assert_eq!(
+            leading_slash_url,
+            "https://s3.amazonaws.com/my-backups/blobs/ab/1234"
+        );
+        let parsed_leading = url::Url::parse(&leading_slash_url).unwrap();
+        assert_eq!(parsed_leading.path(), leading_slash_canon);
+
+        // 5. Endpoint with trailing slash
+        let client_with_slash = S3Client::new(
+            Some("http://127.0.0.1:9000/".into()),
+            "my-backups".into(),
+            "".into(),
+            "us-east-1".into(),
+            "test_access".into(),
+            "test_secret".into(),
+            None,
+        )
+        .unwrap();
+        let url_trailing = client_with_slash.build_request_url("");
+        assert_eq!(url_trailing, "http://127.0.0.1:9000/my-backups");
+        let parsed_trailing = url::Url::parse(&url_trailing).unwrap();
+        assert_eq!(parsed_trailing.path(), "/my-backups");
     }
 }
