@@ -1,13 +1,13 @@
-use tokio::io::{AsyncWrite, AsyncRead};
-use futures_util::pin_mut;
-use futures_util::stream::StreamExt;
-use futures_util::SinkExt;
-use tokio_postgres::{Client, NoTls};
 use crate::database::{BackupStats, DatabaseAdapter, DatabaseMeta, RestoreOptions, RestoreStats};
 use crate::error::DumperError;
 use crate::stream::decoder::StreamDecoder;
 use crate::stream::encoder::StreamEncoder;
 use crate::stream::format::*;
+use futures_util::pin_mut;
+use futures_util::stream::StreamExt;
+use futures_util::SinkExt;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_postgres::{Client, NoTls};
 
 pub struct PostgresAdapter {
     url: String,
@@ -45,7 +45,11 @@ impl DatabaseAdapter for PostgresAdapter {
             .await
             .map_err(|e| DumperError::Database(e.to_string()))?;
         let full_version: String = version_row.get(0);
-        let server_version = full_version.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        let server_version = full_version
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
 
         let db_row = client
             .query_one("SELECT current_database()", &[])
@@ -92,7 +96,12 @@ impl DatabaseAdapter for PostgresAdapter {
         client
             .batch_execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;")
             .await
-            .map_err(|e| DumperError::Database(format!("Failed to start repeatable-read transaction: {}", e)))?;
+            .map_err(|e| {
+                DumperError::Database(format!(
+                    "Failed to start repeatable-read transaction: {}",
+                    e
+                ))
+            })?;
 
         let meta = self.inspect().await?;
 
@@ -122,10 +131,12 @@ impl DatabaseAdapter for PostgresAdapter {
         for row in schema_rows {
             let schema: String = row.get(0);
             if schema != "public" {
-                encoder.write_record(&StreamRecord::PreData(PreDataRecord {
-                    name: schema.clone(),
-                    sql: format!("CREATE SCHEMA IF NOT EXISTS \"{}\";", schema),
-                })).await?;
+                encoder
+                    .write_record(&StreamRecord::PreData(PreDataRecord {
+                        name: schema.clone(),
+                        sql: format!("CREATE SCHEMA IF NOT EXISTS \"{}\";", schema),
+                    }))
+                    .await?;
             }
         }
 
@@ -153,10 +164,12 @@ impl DatabaseAdapter for PostgresAdapter {
             let schema: String = row.get(0);
             let name: String = row.get(1);
             let def: String = row.get(2);
-            encoder.write_record(&StreamRecord::PreData(PreDataRecord {
-                name: format!("{}.{}", schema, name),
-                sql: def,
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::PreData(PreDataRecord {
+                    name: format!("{}.{}", schema, name),
+                    sql: def,
+                }))
+                .await?;
         }
 
         // 4. Tables and Streaming COPY Data
@@ -167,10 +180,18 @@ impl DatabaseAdapter for PostgresAdapter {
             // Columns metadata
             let col_rows = client
                 .query(
-                    "SELECT column_name, data_type, is_nullable, column_default \
-                     FROM information_schema.columns \
-                     WHERE table_schema = $1 AND table_name = $2 \
-                     ORDER BY ordinal_position",
+                    "SELECT \
+                        a.attname::text, \
+                        format_type(a.atttypid, a.atttypmod), \
+                        not a.attnotnull, \
+                        pg_get_expr(d.adbin, d.adrelid) \
+                     FROM pg_attribute a \
+                     JOIN pg_class c ON c.oid = a.attrelid \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+                     WHERE n.nspname = $1 AND c.relname = $2 \
+                       AND a.attnum > 0 AND NOT a.attisdropped \
+                     ORDER BY a.attnum",
                     &[schema, table],
                 )
                 .await
@@ -182,8 +203,7 @@ impl DatabaseAdapter for PostgresAdapter {
             for crow in col_rows {
                 let col_name: String = crow.get(0);
                 let data_type: String = crow.get(1);
-                let is_null_str: String = crow.get(2);
-                let is_nullable = is_null_str.eq_ignore_ascii_case("yes");
+                let is_nullable: bool = crow.get(2);
                 let default_val: Option<String> = crow.get(3);
 
                 let mut def = format!("\"{}\" {}", col_name, data_type);
@@ -210,43 +230,52 @@ impl DatabaseAdapter for PostgresAdapter {
                 col_defs.join(", ")
             );
 
-            encoder.write_record(&StreamRecord::TableSchema(TableSchemaRecord {
-                schema_name: schema.clone(),
-                table_name: table.clone(),
-                columns,
-                create_sql,
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::TableSchema(TableSchemaRecord {
+                    schema_name: schema.clone(),
+                    table_name: table.clone(),
+                    columns,
+                    create_sql,
+                }))
+                .await?;
 
             // Stream COPY Data directly
-            let copy_sql = format!("COPY \"{}\".\"{}\" TO STDOUT (FORMAT binary)", schema, table);
-            let copy_out = client
-                .copy_out(&copy_sql)
-                .await
-                .map_err(|e| DumperError::Database(format!("COPY OUT failed for {}.{}: {}", schema, table, e)))?;
+            let copy_sql = format!(
+                "COPY \"{}\".\"{}\" TO STDOUT (FORMAT binary)",
+                schema, table
+            );
+            let copy_out = client.copy_out(&copy_sql).await.map_err(|e| {
+                DumperError::Database(format!("COPY OUT failed for {}.{}: {}", schema, table, e))
+            })?;
 
             pin_mut!(copy_out);
             let mut slice_seq = 0u64;
 
             while let Some(chunk_res) = copy_out.next().await {
-                let chunk = chunk_res.map_err(|e| DumperError::Database(format!("COPY read error: {}", e)))?;
+                let chunk = chunk_res
+                    .map_err(|e| DumperError::Database(format!("COPY read error: {}", e)))?;
                 slice_seq += 1;
-                encoder.write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
-                    schema_name: schema.clone(),
-                    table_name: table.clone(),
-                    slice_seq,
-                    is_last: false,
-                    data: chunk.to_vec(),
-                })).await?;
+                encoder
+                    .write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
+                        schema_name: schema.clone(),
+                        table_name: table.clone(),
+                        slice_seq,
+                        is_last: false,
+                        data: chunk.to_vec(),
+                    }))
+                    .await?;
             }
 
             // Signal end of table slice
-            encoder.write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
-                schema_name: schema.clone(),
-                table_name: table.clone(),
-                slice_seq: slice_seq + 1,
-                is_last: true,
-                data: Vec::new(),
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
+                    schema_name: schema.clone(),
+                    table_name: table.clone(),
+                    slice_seq: slice_seq + 1,
+                    is_last: true,
+                    data: Vec::new(),
+                }))
+                .await?;
 
             tables_backed_up += 1;
         }
@@ -268,16 +297,21 @@ impl DatabaseAdapter for PostgresAdapter {
         for srow in seq_rows {
             let schema: String = srow.get(0);
             let seq: String = srow.get(1);
-            let seq_val_sql = format!("SELECT last_value, is_called FROM \"{}\".\"{}\"", schema, seq);
-            if let Ok(val_row) = client.query_one(&seq_val_sql, &[]) .await {
+            let seq_val_sql = format!(
+                "SELECT last_value, is_called FROM \"{}\".\"{}\"",
+                schema, seq
+            );
+            if let Ok(val_row) = client.query_one(&seq_val_sql, &[]).await {
                 let last_value: i64 = val_row.get(0);
                 let is_called: bool = val_row.get(1);
-                encoder.write_record(&StreamRecord::Sequence(SequenceRecord {
-                    schema_name: schema,
-                    sequence_name: seq,
-                    last_value,
-                    is_called,
-                })).await?;
+                encoder
+                    .write_record(&StreamRecord::Sequence(SequenceRecord {
+                        schema_name: schema,
+                        sequence_name: seq,
+                        last_value,
+                        is_called,
+                    }))
+                    .await?;
             }
         }
 
@@ -301,20 +335,30 @@ impl DatabaseAdapter for PostgresAdapter {
             let view_def: String = vrow.get(2);
             let relkind: i8 = vrow.get(3);
             let sql = if relkind == b'm' as i8 {
-                format!("CREATE MATERIALIZED VIEW \"{}\".\"{}\" AS {}", schema, view_name, view_def)
+                format!(
+                    "CREATE MATERIALIZED VIEW \"{}\".\"{}\" AS {}",
+                    schema, view_name, view_def
+                )
             } else {
-                format!("CREATE OR REPLACE VIEW \"{}\".\"{}\" AS {}", schema, view_name, view_def)
+                format!(
+                    "CREATE OR REPLACE VIEW \"{}\".\"{}\" AS {}",
+                    schema, view_name, view_def
+                )
             };
-            let r_type = if relkind == b'm' as i8 { "MATERIALIZED_VIEW" } else { "VIEW" };
-            encoder.write_record(&StreamRecord::Routine(RoutineRecord {
-                schema_name: schema,
-                name: view_name,
-                routine_type: r_type.into(),
-                sql,
-            })).await?;
+            let r_type = if relkind == b'm' as i8 {
+                "MATERIALIZED_VIEW"
+            } else {
+                "VIEW"
+            };
+            encoder
+                .write_record(&StreamRecord::Routine(RoutineRecord {
+                    schema_name: schema,
+                    name: view_name,
+                    routine_type: r_type.into(),
+                    sql,
+                }))
+                .await?;
         }
-
-
 
         // 7. Functions
         let func_rows = client
@@ -333,12 +377,14 @@ impl DatabaseAdapter for PostgresAdapter {
             let schema: String = row.get(0);
             let func_name: String = row.get(1);
             if let Some(func_def) = row.get::<_, Option<String>>(2) {
-                encoder.write_record(&StreamRecord::Routine(RoutineRecord {
-                    schema_name: schema,
-                    name: func_name,
-                    routine_type: "FUNCTION".into(),
-                    sql: func_def,
-                })).await?;
+                encoder
+                    .write_record(&StreamRecord::Routine(RoutineRecord {
+                        schema_name: schema,
+                        name: func_name,
+                        routine_type: "FUNCTION".into(),
+                        sql: func_def,
+                    }))
+                    .await?;
             }
         }
 
@@ -360,12 +406,14 @@ impl DatabaseAdapter for PostgresAdapter {
             let table: String = irow.get(1);
             let index_name: String = irow.get(2);
             let index_def: String = irow.get(3);
-            encoder.write_record(&StreamRecord::PostData(PostDataRecord {
-                schema_name: schema,
-                table_name: table,
-                name: index_name,
-                sql: format!("{};", index_def),
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::PostData(PostDataRecord {
+                    schema_name: schema,
+                    table_name: table,
+                    name: index_name,
+                    sql: format!("{};", index_def),
+                }))
+                .await?;
         }
 
         // 9. Constraints (Primary, Foreign, Unique, Check)
@@ -389,12 +437,17 @@ impl DatabaseAdapter for PostgresAdapter {
             let table: String = row.get(1);
             let name: String = row.get(2);
             let def: String = row.get(3);
-            encoder.write_record(&StreamRecord::PostData(PostDataRecord {
-                schema_name: schema.clone(),
-                table_name: table.clone(),
-                name: name.clone(),
-                sql: format!("ALTER TABLE \"{}\".\"{}\" ADD CONSTRAINT \"{}\" {};", schema, table, name, def),
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::PostData(PostDataRecord {
+                    schema_name: schema.clone(),
+                    table_name: table.clone(),
+                    name: name.clone(),
+                    sql: format!(
+                        "ALTER TABLE \"{}\".\"{}\" ADD CONSTRAINT \"{}\" {};",
+                        schema, table, name, def
+                    ),
+                }))
+                .await?;
         }
 
         // 10. Triggers
@@ -416,12 +469,14 @@ impl DatabaseAdapter for PostgresAdapter {
             let table: String = row.get(1);
             let name: String = row.get(2);
             let def: String = row.get(3);
-            encoder.write_record(&StreamRecord::PostData(PostDataRecord {
-                schema_name: schema,
-                table_name: table,
-                name,
-                sql: format!("{};", def),
-            })).await?;
+            encoder
+                .write_record(&StreamRecord::PostData(PostDataRecord {
+                    schema_name: schema,
+                    table_name: table,
+                    name,
+                    sql: format!("{};", def),
+                }))
+                .await?;
         }
 
         // Commit/End read transaction
@@ -448,7 +503,11 @@ impl DatabaseAdapter for PostgresAdapter {
         let mut records_processed = 0u64;
 
         // Pending COPY sink handle
-        let mut active_copy_sink: Option<(String, String, std::pin::Pin<Box<tokio_postgres::CopyInSink<bytes::Bytes>>>)> = None;
+        let mut active_copy_sink: Option<(
+            String,
+            String,
+            std::pin::Pin<Box<tokio_postgres::CopyInSink<bytes::Bytes>>>,
+        )> = None;
 
         while let Some(record) = decoder.read_next_record().await? {
             records_processed += 1;
@@ -469,11 +528,22 @@ impl DatabaseAdapter for PostgresAdapter {
                 }
                 StreamRecord::TableSchema(s) => {
                     if options.drop_existing {
-                        let drop_sql = format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE;", s.schema_name, s.table_name);
+                        let drop_sql = format!(
+                            "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE;",
+                            s.schema_name, s.table_name
+                        );
                         let _ = client.batch_execute(&drop_sql).await;
                     }
                     client.batch_execute(&s.create_sql).await.map_err(|e| {
-                        DumperError::Restore(format!("Failed to create table {}.{}: {}", s.schema_name, s.table_name, e))
+                        let msg = if let Some(d) = e.as_db_error() {
+                            format!("{}: {}", d.message(), d.detail().unwrap_or(""))
+                        } else {
+                            e.to_string()
+                        };
+                        DumperError::Restore(format!(
+                            "Failed to create table {}.{}: {} (SQL: {})",
+                            s.schema_name, s.table_name, msg, s.create_sql
+                        ))
                     })?;
                     tables_restored += 1;
                 }
@@ -485,25 +555,41 @@ impl DatabaseAdapter for PostgresAdapter {
                     };
 
                     if needs_new_sink && !d.is_last {
-                        let copy_sql = format!("COPY \"{}\".\"{}\" FROM STDIN (FORMAT binary)", d.schema_name, d.table_name);
+                        let copy_sql = format!(
+                            "COPY \"{}\".\"{}\" FROM STDIN (FORMAT binary)",
+                            d.schema_name, d.table_name
+                        );
                         let sink = Box::pin(client.copy_in(&copy_sql).await.map_err(|e| {
-                            DumperError::Restore(format!("COPY IN initialization failed for {}.{}: {}", d.schema_name, d.table_name, e))
+                            DumperError::Restore(format!(
+                                "COPY IN initialization failed for {}.{}: {}",
+                                d.schema_name, d.table_name, e
+                            ))
                         })?);
-                        active_copy_sink = Some((d.schema_name.clone(), d.table_name.clone(), sink));
+                        active_copy_sink =
+                            Some((d.schema_name.clone(), d.table_name.clone(), sink));
                     }
 
                     if let Some((_, _, ref mut sink)) = active_copy_sink {
                         if !d.data.is_empty() {
-                            sink.as_mut().feed(bytes::Bytes::from(d.data)).await.map_err(|e| {
-                                DumperError::Restore(format!("COPY IN data write failed: {}", e))
-                            })?;
+                            sink.as_mut()
+                                .feed(bytes::Bytes::from(d.data))
+                                .await
+                                .map_err(|e| {
+                                    DumperError::Restore(format!(
+                                        "COPY IN data write failed: {}",
+                                        e
+                                    ))
+                                })?;
                         }
                     }
 
                     if d.is_last {
                         if let Some((_, _, mut sink)) = active_copy_sink.take() {
                             sink.as_mut().finish().await.map_err(|e| {
-                                DumperError::Restore(format!("COPY IN finish failed for {}.{}: {}", d.schema_name, d.table_name, e))
+                                DumperError::Restore(format!(
+                                    "COPY IN finish failed for {}.{}: {}",
+                                    d.schema_name, d.table_name, e
+                                ))
                             })?;
                         }
                     }

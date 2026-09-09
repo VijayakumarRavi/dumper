@@ -1,10 +1,10 @@
+use dumper::database::postgres::PostgresAdapter;
+use dumper::database::{DatabaseAdapter, RestoreOptions};
+use dumper::stream::decoder::StreamDecoder;
+use dumper::stream::encoder::StreamEncoder;
+use dumper::stream::format::*;
 use std::process::Command;
 use tempfile::TempDir;
-use dumper::database::{DatabaseAdapter, RestoreOptions};
-use dumper::database::postgres::PostgresAdapter;
-use dumper::stream::encoder::StreamEncoder;
-use dumper::stream::decoder::StreamDecoder;
-use dumper::stream::format::*;
 
 struct TestPgServer {
     dir: TempDir,
@@ -19,15 +19,26 @@ impl TestPgServer {
 
         let init_status = Command::new("initdb")
             .args(["-D", path, "--no-sync", "-A", "trust", "-U", "postgres"])
-            .output().ok()?;
+            .output()
+            .ok()?;
         if !init_status.status.success() {
             return None;
         }
 
         let log_file = format!("{}/pg.log", path);
         let start_status = Command::new("pg_ctl")
-            .args(["-D", path, "-l", &log_file, "-o", &format!("-p {}", port), "-w", "start"])
-            .output().ok()?;
+            .args([
+                "-D",
+                path,
+                "-l",
+                &log_file,
+                "-o",
+                &format!("-p {}", port),
+                "-w",
+                "start",
+            ])
+            .output()
+            .ok()?;
         if !start_status.status.success() {
             return None;
         }
@@ -75,7 +86,10 @@ async fn test_postgres_restore_propagates_postdata_error() {
             dumper_version: "0.1.0".into(),
             start_time: 1700000000,
         };
-        encoder.write_record(&StreamRecord::Header(header)).await.unwrap();
+        encoder
+            .write_record(&StreamRecord::Header(header))
+            .await
+            .unwrap();
 
         // Create a valid table
         let schema = TableSchemaRecord {
@@ -89,7 +103,10 @@ async fn test_postgres_restore_propagates_postdata_error() {
             }],
             create_sql: "CREATE TABLE public.items (id integer NOT NULL);".into(),
         };
-        encoder.write_record(&StreamRecord::TableSchema(schema)).await.unwrap();
+        encoder
+            .write_record(&StreamRecord::TableSchema(schema))
+            .await
+            .unwrap();
 
         // PostData with completely invalid SQL syntax
         let invalid_post = PostDataRecord {
@@ -98,7 +115,10 @@ async fn test_postgres_restore_propagates_postdata_error() {
             name: "broken_constraint".into(),
             sql: "ALTER TABLE public.items ADD CONSTRAINT invalid_syn TAX ERROR;".into(),
         };
-        encoder.write_record(&StreamRecord::PostData(invalid_post)).await.unwrap();
+        encoder
+            .write_record(&StreamRecord::PostData(invalid_post))
+            .await
+            .unwrap();
 
         encoder.finish().await.unwrap();
     }
@@ -121,5 +141,130 @@ async fn test_postgres_restore_propagates_postdata_error() {
             );
         }
         Ok(_) => panic!("Restore must fail when PostData contains invalid constraint or fails"),
+    }
+}
+
+#[tokio::test]
+async fn test_postgres_custom_types_and_precision_preserved() {
+    let pg = match TestPgServer::start() {
+        Some(server) => server,
+        None => {
+            eprintln!("PostgreSQL not available or failed to start, skipping test.");
+            return;
+        }
+    };
+
+    let adapter = PostgresAdapter::new(&pg.url());
+
+    // Setup source schema with ENUM, VARCHAR(50), NUMERIC(10, 2), ARRAY
+    {
+        let (client, conn) = tokio_postgres::connect(&pg.url(), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client.batch_execute("
+            CREATE TYPE priority_level AS ENUM ('low', 'medium', 'high');
+            CREATE TABLE tasks (
+                id integer PRIMARY KEY,
+                title varchar(50) NOT NULL,
+                budget numeric(10, 2) DEFAULT 100.50,
+                tags text[],
+                priority priority_level
+            );
+            INSERT INTO tasks (id, title, budget, tags, priority) VALUES (1, 'Test Task', 123.45, ARRAY['dev', 'rust'], 'high');
+        ").await.unwrap();
+    }
+
+    // Backup
+    let mut buffer = Vec::new();
+    {
+        let mut encoder = StreamEncoder::new(&mut buffer);
+        let stats = adapter.backup(&mut encoder).await.unwrap();
+        assert_eq!(stats.tables_backed_up, 1);
+        encoder.finish().await.unwrap();
+    }
+
+    // Inspect stream records: ensure 'priority_level' is used, NOT 'USER-DEFINED', and VARCHAR/NUMERIC have bounds
+    {
+        let mut decoder = StreamDecoder::new(&buffer[..]);
+        let mut found_schema = false;
+        while let Some(rec) = decoder.read_next_record().await.unwrap() {
+            if let StreamRecord::TableSchema(s) = rec {
+                if s.table_name == "tasks" {
+                    found_schema = true;
+                    assert!(
+                        s.create_sql.contains("priority_level"),
+                        "create_sql must contain exact enum name: {}",
+                        s.create_sql
+                    );
+                    assert!(
+                        !s.create_sql.contains("USER-DEFINED"),
+                        "create_sql must NOT contain USER-DEFINED: {}",
+                        s.create_sql
+                    );
+                    assert!(
+                        s.create_sql.contains("character varying(50)")
+                            || s.create_sql.contains("varchar(50)"),
+                        "VARCHAR length must be preserved: {}",
+                        s.create_sql
+                    );
+                    assert!(
+                        s.create_sql.contains("numeric(10,2)")
+                            || s.create_sql.contains("numeric(10, 2)"),
+                        "NUMERIC precision must be preserved: {}",
+                        s.create_sql
+                    );
+                }
+            }
+        }
+        assert!(found_schema);
+    }
+
+    // Drop table and type in database
+    {
+        let (client, conn) = tokio_postgres::connect(&pg.url(), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .batch_execute("DROP TABLE tasks CASCADE; DROP TYPE priority_level;")
+            .await
+            .unwrap();
+    }
+
+    // Restore
+    let mut decoder = StreamDecoder::new(&buffer[..]);
+    let options = RestoreOptions {
+        target_database_override: None,
+        drop_existing: true,
+    };
+    let restore_stats = adapter.restore(&mut decoder, &options).await.unwrap();
+    assert_eq!(restore_stats.tables_restored, 1);
+
+    // Verify restored row
+    {
+        let (client, conn) = tokio_postgres::connect(&pg.url(), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        match client
+            .query_opt("SELECT title, priority::text FROM tasks", &[])
+            .await
+        {
+            Ok(Some(row)) => {
+                let title: String = row.get(0);
+                let priority: String = row.get(1);
+                assert_eq!(title, "Test Task");
+                assert_eq!(priority, "high");
+            }
+            Ok(None) => panic!("No rows found in restored tasks table!"),
+            Err(e) => panic!("Querying tasks failed: {}", e),
+        }
     }
 }
