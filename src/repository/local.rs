@@ -122,9 +122,9 @@ impl StorageBackend for LocalBackend {
     }
 
     async fn list_objects(&self, prefix: &str) -> Result<Vec<String>, DumperError> {
-        let prefix_clean = prefix.trim_start_matches('/');
+        let prefix_clean = prefix.trim_start_matches('/').replace('\\', "/");
         let mut results = Vec::new();
-        let target_dir = self.base_path.join(prefix_clean);
+        let target_dir = self.base_path.join(&prefix_clean);
 
         if !fs::try_exists(&target_dir).await.unwrap_or(false) {
             // It might be a prefix of file names, or directory doesn't exist
@@ -134,8 +134,9 @@ impl StorageBackend for LocalBackend {
                 while let Some(entry) = entries.next_entry().await? {
                     let full_path = entry.path();
                     if let Ok(rel) = full_path.strip_prefix(&self.base_path) {
-                        let rel_str = rel.to_string_lossy().to_string();
-                        if rel_str.starts_with(prefix_clean) && entry.file_type().await?.is_file() {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if rel_str.starts_with(&prefix_clean) && entry.file_type().await?.is_file()
+                        {
                             results.push(rel_str);
                         }
                     }
@@ -158,7 +159,7 @@ impl StorageBackend for LocalBackend {
                     dirs.push(full_path);
                 } else if file_type.is_file() {
                     if let Ok(rel) = full_path.strip_prefix(&self.base_path) {
-                        let rel_str = rel.to_string_lossy().to_string();
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
                         // Ignore hidden temp files
                         if !entry.file_name().to_string_lossy().starts_with(".tmp_") {
                             results.push(rel_str);
