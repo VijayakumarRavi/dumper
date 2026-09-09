@@ -438,3 +438,107 @@ async fn test_repository_large_object_count() {
     let verified = engine.verify_snapshot(&snap).await.unwrap();
     assert_eq!(verified, 100);
 }
+
+#[tokio::test]
+async fn test_repository_large_object_count_1000_blobs() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(
+        dumper::repository::local::LocalBackend::new(temp_dir.path())
+            .await
+            .unwrap(),
+    );
+    let password = "large-object-count-1000-test";
+
+    let engine = RepositoryEngine::init(backend.clone(), password)
+        .await
+        .unwrap();
+
+    const BLOB_COUNT: usize = 1000;
+    let mut all_blob_refs = Vec::with_capacity(BLOB_COUNT);
+
+    for i in 0..BLOB_COUNT {
+        let content = format!("Unique payload chunk for object index {:05} with padding...", i);
+        let hash = hex::encode(Sha256::digest(content.as_bytes()));
+        let (r, _) = engine
+            .put_chunk(content.as_bytes(), &hash, CompressionLevel::Fast)
+            .await
+            .unwrap();
+        all_blob_refs.push(r);
+    }
+
+    // Snapshot 1 references all 1000 blobs
+    let snap1 = SnapshotMetadata {
+        id: "snap_1000_all".into(),
+        full_id: "snap_1000_all_full_hash".into(),
+        format_version: 1,
+        dumper_version: "0.1.0".into(),
+        engine: "postgres".into(),
+        database: "large_catalog".into(),
+        server_version: "16.0".into(),
+        started_at: chrono::Utc::now(),
+        completed_at: chrono::Utc::now(),
+        duration_seconds: 2,
+        logical_bytes: 50000,
+        stored_bytes: 100000,
+        deduplicated_bytes: 0,
+        table_count: 50,
+        compression: "fast".into(),
+        tag: Some("baseline".into()),
+        blobs: all_blob_refs.clone(),
+    };
+    engine.commit_snapshot(&snap1).await.unwrap();
+
+    // Snapshot 2 references only the second half (500 blobs)
+    let snap2 = SnapshotMetadata {
+        id: "snap_500_half".into(),
+        full_id: "snap_500_half_full_hash".into(),
+        format_version: 1,
+        dumper_version: "0.1.0".into(),
+        engine: "postgres".into(),
+        database: "large_catalog".into(),
+        server_version: "16.0".into(),
+        started_at: chrono::Utc::now(),
+        completed_at: chrono::Utc::now(),
+        duration_seconds: 1,
+        logical_bytes: 25000,
+        stored_bytes: 50000,
+        deduplicated_bytes: 50000,
+        table_count: 25,
+        compression: "fast".into(),
+        tag: Some("incremental".into()),
+        blobs: all_blob_refs[500..].to_vec(),
+    };
+    engine.commit_snapshot(&snap2).await.unwrap();
+
+    // Check validates both snapshots and all 1000 unique blobs across shards
+    let (snaps, missing, orphans) = engine.check().await.unwrap();
+    assert_eq!(snaps, 2);
+    assert_eq!(missing, 0);
+    assert_eq!(orphans, 0);
+
+    // Verify snapshot 1
+    let verified1 = engine.verify_snapshot(&snap1).await.unwrap();
+    assert_eq!(verified1, 1000);
+
+    // Verify snapshot 2
+    let verified2 = engine.verify_snapshot(&snap2).await.unwrap();
+    assert_eq!(verified2, 500);
+
+    // Delete snapshot 1 (leaving only snapshot 2 referencing blobs 500..1000)
+    engine.delete_snapshot(&snap1.id).await.unwrap();
+
+    // Prune should delete exactly 500 unreferenced blobs (blobs 0..500)
+    let (pruned_blobs, pruned_bytes) = engine.prune().await.unwrap();
+    assert_eq!(pruned_blobs, 500, "Prune must remove exactly 500 dereferenced blobs");
+    assert!(pruned_bytes > 0, "Prune must report positive bytes freed");
+
+    // Check after prune: 1 snapshot remaining, 500 live blobs, 0 missing, 0 orphans
+    let (snaps_after, missing_after, orphans_after) = engine.check().await.unwrap();
+    assert_eq!(snaps_after, 1);
+    assert_eq!(missing_after, 0);
+    assert_eq!(orphans_after, 0);
+
+    // Remaining snapshot must still verify all 500 retained blobs
+    let verified_after = engine.verify_snapshot(&snap2).await.unwrap();
+    assert_eq!(verified_after, 500);
+}
