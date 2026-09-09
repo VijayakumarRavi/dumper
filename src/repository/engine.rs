@@ -210,10 +210,7 @@ impl<B: StorageBackend> RepositoryEngine<B> {
         let mut deleted_bytes = 0u64;
 
         for blob_key in all_blobs {
-            let hash = blob_key
-                .split(|c| c == '/' || c == '\\')
-                .next_back()
-                .unwrap_or("");
+            let hash = blob_key.split(['/', '\\']).next_back().unwrap_or("");
             if !referenced_hashes.contains(hash) {
                 if let Ok(size) = self.backend.get_object_size(&blob_key).await {
                     deleted_bytes += size;
@@ -265,10 +262,7 @@ impl<B: StorageBackend> RepositoryEngine<B> {
         let mut orphaned_count = 0;
 
         for blob_key in &all_blobs {
-            let hash = blob_key
-                .split(|c| c == '/' || c == '\\')
-                .next_back()
-                .unwrap_or("");
+            let hash = blob_key.split(['/', '\\']).next_back().unwrap_or("");
             if !referenced_hashes.contains(hash) {
                 orphaned_count += 1;
             }
