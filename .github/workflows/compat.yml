@@ -1,0 +1,199 @@
+name: Database Compatibility Matrix
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+  push:
+    branches:
+      - master
+      - "renovate/**"
+    paths-ignore:
+      - "**/*.md"
+  schedule:
+    - cron: "0 2 * * 0" # Weekly on Sunday at 02:00
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-compat:
+    name: Postgres ${{ matrix.pg_version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [14, 15, 16, 17]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg_version }}
+        env:
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_USER: postgres
+          POSTGRES_DB: compat_pg
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install postgres client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      - name: Build Dumper
+        run: cargo build --release
+
+      - name: Test Backup & Restore on Postgres ${{ matrix.pg_version }}
+        run: |
+          export DUMPER_PASSWORD="compat-password"
+          REPO="/tmp/dumper-pg-${{ matrix.pg_version }}"
+          ./target/release/dumper -r "$REPO" init
+
+          PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d compat_pg -c \
+            "CREATE TABLE users (id serial primary key, name text, tags text[], created_at timestamptz default now());"
+          PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d compat_pg -c \
+            "INSERT INTO users (name, tags) VALUES ('User 1', ARRAY['admin', 'ops']), ('User 2', ARRAY['billing']);"
+
+          ./target/release/dumper -r "$REPO" backup "postgres://postgres:testpassword@127.0.0.1:5432/compat_pg"
+          
+          SNAP=$(./target/release/dumper -r "$REPO" --json snapshots | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
+          ./target/release/dumper -r "$REPO" verify "$SNAP" --restore-test
+
+          PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d compat_pg -c "DROP TABLE users;"
+          ./target/release/dumper -r "$REPO" restore "$SNAP" --target "postgres://postgres:testpassword@127.0.0.1:5432/compat_pg"
+
+          COUNT=$(PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d compat_pg -tAc "SELECT count(*) FROM users;")
+          [ "$COUNT" -eq 2 ] || exit 1
+
+  mysql-compat:
+    name: MySQL ${{ matrix.mysql_version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql_version: ["8.0", "8.4"]
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql_version }}
+        env:
+          MYSQL_ROOT_PASSWORD: testpassword
+          MYSQL_DATABASE: compat_mysql
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -uroot -ptestpassword"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install MySQL client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mysql-client
+
+      - name: Build Dumper
+        run: cargo build --release
+
+      - name: Test Backup & Restore on MySQL ${{ matrix.mysql_version }}
+        run: |
+          export DUMPER_PASSWORD="compat-password"
+          REPO="/tmp/dumper-mysql-${{ matrix.mysql_version }}"
+          ./target/release/dumper -r "$REPO" init
+
+          mysql -h 127.0.0.1 -P 3306 -u root -ptestpassword compat_mysql -e \
+            "CREATE TABLE products (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(100), price DECIMAL(10,2));"
+          mysql -h 127.0.0.1 -P 3306 -u root -ptestpassword compat_mysql -e \
+            "INSERT INTO products (title, price) VALUES ('Widget A', 19.99), ('Widget B', 49.50);"
+
+          ./target/release/dumper -r "$REPO" backup "mysql://root:testpassword@127.0.0.1:3306/compat_mysql"
+          
+          SNAP=$(./target/release/dumper -r "$REPO" --json snapshots | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
+          ./target/release/dumper -r "$REPO" verify "$SNAP" --restore-test
+
+          mysql -h 127.0.0.1 -P 3306 -u root -ptestpassword compat_mysql -e "DROP TABLE products;"
+          ./target/release/dumper -r "$REPO" restore "$SNAP" --target "mysql://root:testpassword@127.0.0.1:3306/compat_mysql"
+
+          COUNT=$(mysql -h 127.0.0.1 -P 3306 -u root -ptestpassword -N -s -e "SELECT count(*) FROM compat_mysql.products;")
+          [ "$COUNT" -eq 2 ] || exit 1
+
+  mariadb-compat:
+    name: MariaDB ${{ matrix.mariadb_version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mariadb_version: ["10.11", "11.4"]
+    services:
+      mariadb:
+        image: mariadb:${{ matrix.mariadb_version }}
+        env:
+          MARIADB_ROOT_PASSWORD: testpassword
+          MARIADB_DATABASE: compat_mariadb
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install MariaDB client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mariadb-client
+
+      - name: Build Dumper
+        run: cargo build --release
+
+      - name: Test Backup & Restore on MariaDB ${{ matrix.mariadb_version }}
+        run: |
+          export DUMPER_PASSWORD="compat-password"
+          REPO="/tmp/dumper-mariadb-${{ matrix.mariadb_version }}"
+          ./target/release/dumper -r "$REPO" init
+
+          mariadb -h 127.0.0.1 -P 3306 -u root -ptestpassword compat_mariadb -e \
+            "CREATE TABLE customers (id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(100), active BOOLEAN);"
+          mariadb -h 127.0.0.1 -P 3306 -u root -ptestpassword compat_mariadb -e \
+            "INSERT INTO customers (email, active) VALUES ('test1@example.com', 1), ('test2@example.com', 0);"
+
+          ./target/release/dumper -r "$REPO" backup "mysql://root:testpassword@127.0.0.1:3306/compat_mariadb"
+          
+          SNAP=$(./target/release/dumper -r "$REPO" --json snapshots | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
+          ./target/release/dumper -r "$REPO" verify "$SNAP" --restore-test
+
+          mariadb -h 127.0.0.1 -P 3306 -u root -ptestpassword compat_mariadb -e "DROP TABLE customers;"
+          ./target/release/dumper -r "$REPO" restore "$SNAP" --target "mysql://root:testpassword@127.0.0.1:3306/compat_mariadb"
+
+          COUNT=$(mariadb -h 127.0.0.1 -P 3306 -u root -ptestpassword -N -s -e "SELECT count(*) FROM compat_mariadb.customers;")
+          [ "$COUNT" -eq 2 ] || exit 1
+
+  result:
+    name: Result (Compatibility)
+    runs-on: ubuntu-latest
+    needs:
+      - postgres-compat
+      - mysql-compat
+      - mariadb-compat
+    steps:
+      - name: Mark the job as successful
+        run: exit 0
+        if: success()
+      - name: Mark the job as unsuccessful
+        run: exit 1
+        if: "!success()"

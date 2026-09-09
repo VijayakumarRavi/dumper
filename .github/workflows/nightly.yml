@@ -1,0 +1,81 @@
+name: Nightly Build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 0 * * *"
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: dumper
+
+jobs:
+  nightly-build:
+    name: Nightly ${{ matrix.job.target }}
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable]
+        job:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.job.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-${{ matrix.job.target }}
+
+      - name: Install cross toolchain if needed
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.job.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.job.target }}
+
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          DATE=$(date +'%Y%m%d')
+          ARCHIVE="${{ env.BINARY_NAME }}-nightly-${DATE}-${{ matrix.job.target }}.tar.gz"
+          cd "target/${{ matrix.job.target }}/release"
+          tar -czf "../../../${ARCHIVE}" "${{ env.BINARY_NAME }}"
+          cd "../../.."
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $DATE = Get-Date -Format "yyyyMMdd"
+          $ARCHIVE = "${{ env.BINARY_NAME }}-nightly-${DATE}-${{ matrix.job.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.job.target }}/release/${{ env.BINARY_NAME }}.exe" -DestinationPath $ARCHIVE
+          $HASH = (Get-FileHash -Path $ARCHIVE -Algorithm SHA256).Hash.ToLower()
+          "$HASH  $ARCHIVE" | Out-File -FilePath "$ARCHIVE.sha256" -Encoding ascii
+
+      - name: Upload Nightly Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ matrix.job.target }}
+          path: |
+            ${{ env.BINARY_NAME }}-nightly-*

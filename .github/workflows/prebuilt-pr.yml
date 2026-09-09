@@ -1,0 +1,77 @@
+name: Create PR artifacts
+
+on:
+  pull_request:
+    types: [labeled]
+    branches:
+      - master
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**/*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  BINARY_NAME: dumper
+
+jobs:
+  pr-build:
+    if: ${{ github.event.label.name == 'S-build' || github.event_name == 'workflow_dispatch' }}
+    name: Build PR on ${{ matrix.job.target }}
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      matrix:
+        rust: [stable]
+        job:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.job.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr-${{ matrix.job.target }}
+
+      - name: Install cross toolchain if needed
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.job.target }}
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.job.target }}
+
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          PR_NUM=${{ github.event.pull_request.number || 'manual' }}
+          ARCHIVE="${{ env.BINARY_NAME }}-pr${PR_NUM}-${{ matrix.job.target }}.tar.gz"
+          cd "target/${{ matrix.job.target }}/release"
+          tar -czf "../../../${ARCHIVE}" "${{ env.BINARY_NAME }}"
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $PR_NUM = if ($env:GITHUB_EVENT_PULL_REQUEST_NUMBER) { $env:GITHUB_EVENT_PULL_REQUEST_NUMBER } else { "manual" }
+          $ARCHIVE = "${{ env.BINARY_NAME }}-pr${PR_NUM}-${{ matrix.job.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.job.target }}/release/${{ env.BINARY_NAME }}.exe" -DestinationPath $ARCHIVE
+
+      - name: Upload PR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-${{ matrix.job.target }}
+          path: |
+            ${{ env.BINARY_NAME }}-pr*
