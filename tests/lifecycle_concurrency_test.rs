@@ -129,3 +129,80 @@ async fn test_lock_cleanup_all_active_signal_safety() {
         .unwrap();
     exclusive.release().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_lock_heartbeat_renewal() {
+    let dir = tempdir().unwrap();
+    let backend = std::sync::Arc::new(
+        dumper::repository::local::LocalBackend::new(dir.path().to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+
+    // Acquire lock with rapid 40ms heartbeat interval
+    let mut lock = RepositoryLock::acquire_with_heartbeat_interval(
+        backend.clone(),
+        LockType::Shared,
+        std::time::Duration::from_millis(40),
+    )
+    .await
+    .unwrap();
+
+    let initial_hb = lock.info.last_heartbeat.unwrap();
+
+    // Sleep 100ms to allow at least 2 heartbeat ticks
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Read lock file directly from storage
+    use dumper::repository::backend::StorageBackend;
+    let data = backend.get_object(&lock.path).await.unwrap();
+    let info: dumper::repository::lock::LockInfo = serde_json::from_slice(&data).unwrap();
+
+    assert!(
+        info.last_heartbeat.is_some(),
+        "Heartbeat must be recorded in lock file"
+    );
+    assert!(
+        info.last_heartbeat.unwrap() > initial_hb,
+        "Heartbeat timestamp must advance over time"
+    );
+
+    lock.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_corrupted_lock_file_unlock_force() {
+    let dir = tempdir().unwrap();
+    let backend = std::sync::Arc::new(
+        dumper::repository::local::LocalBackend::new(dir.path().to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+
+    // Write a corrupted lock file
+    use dumper::repository::backend::StorageBackend;
+    backend
+        .put_object("locks/corrupted_lock_xyz", b"MALFORMED_JSON_BYTES")
+        .await
+        .unwrap();
+
+    // Non-force unlock must not remove corrupted lock file
+    let removed_normal = RepositoryLock::unlock_all(backend.as_ref(), false)
+        .await
+        .unwrap();
+    assert_eq!(removed_normal, 0);
+    assert!(backend
+        .object_exists("locks/corrupted_lock_xyz")
+        .await
+        .unwrap());
+
+    // Force unlock MUST remove corrupted lock file
+    let removed_force = RepositoryLock::unlock_all(backend.as_ref(), true)
+        .await
+        .unwrap();
+    assert_eq!(removed_force, 1);
+    assert!(!backend
+        .object_exists("locks/corrupted_lock_xyz")
+        .await
+        .unwrap());
+}

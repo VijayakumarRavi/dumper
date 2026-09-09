@@ -27,6 +27,8 @@ pub struct LockInfo {
     pub hostname: String,
     pub pid: u32,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_heartbeat: Option<DateTime<Utc>>,
 }
 
 pub struct RepositoryLock {
@@ -38,6 +40,7 @@ pub struct RepositoryLockGuard<B: StorageBackend + 'static> {
     lock: Option<RepositoryLock>,
     backend: Arc<B>,
     registration_id: u64,
+    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<B: StorageBackend + 'static> std::ops::Deref for RepositoryLockGuard<B> {
@@ -49,6 +52,9 @@ impl<B: StorageBackend + 'static> std::ops::Deref for RepositoryLockGuard<B> {
 
 impl<B: StorageBackend + 'static> RepositoryLockGuard<B> {
     pub async fn release(&mut self) -> Result<(), DumperError> {
+        if let Some(task) = self.heartbeat_task.take() {
+            task.abort();
+        }
         if let Some(lock) = self.lock.take() {
             if let Ok(mut map) = ACTIVE_CLEANUPS.lock() {
                 map.remove(&self.registration_id);
@@ -61,6 +67,9 @@ impl<B: StorageBackend + 'static> RepositoryLockGuard<B> {
 
 impl<B: StorageBackend + 'static> Drop for RepositoryLockGuard<B> {
     fn drop(&mut self) {
+        if let Some(task) = self.heartbeat_task.take() {
+            task.abort();
+        }
         if let Some(lock) = self.lock.take() {
             if let Ok(mut map) = ACTIVE_CLEANUPS.lock() {
                 map.remove(&self.registration_id);
@@ -81,6 +90,19 @@ impl RepositoryLock {
         backend: Arc<B>,
         lock_type: LockType,
     ) -> Result<RepositoryLockGuard<B>, DumperError> {
+        Self::acquire_with_heartbeat_interval(
+            backend,
+            lock_type,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+    }
+
+    pub async fn acquire_with_heartbeat_interval<B: StorageBackend + 'static>(
+        backend: Arc<B>,
+        lock_type: LockType,
+        heartbeat_interval: std::time::Duration,
+    ) -> Result<RepositoryLockGuard<B>, DumperError> {
         let lock = Self::acquire_raw(&*backend, lock_type).await?;
         let reg_id = NEXT_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -98,10 +120,26 @@ impl RepositoryLock {
             map.insert(reg_id, cleanup_fn);
         }
 
+        let hb_backend = backend.clone();
+        let hb_path = lock.path.clone();
+        let mut hb_info = lock.info.clone();
+        let heartbeat_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat_interval);
+            interval.tick().await; // Initial tick completes immediately
+            loop {
+                interval.tick().await;
+                hb_info.last_heartbeat = Some(Utc::now());
+                if let Ok(data) = serde_json::to_vec(&hb_info) {
+                    let _ = hb_backend.put_object(&hb_path, &data).await;
+                }
+            }
+        });
+
         Ok(RepositoryLockGuard {
             lock: Some(lock),
             backend,
             registration_id: reg_id,
+            heartbeat_task: Some(heartbeat_task),
         })
     }
 
@@ -136,13 +174,15 @@ impl RepositoryLock {
         let lock_id = hex::encode(rand::random::<[u8; 8]>());
         let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
         let pid = std::process::id();
+        let now = Utc::now();
 
         let info = LockInfo {
             lock_id: lock_id.clone(),
             lock_type: lock_type.clone(),
             hostname,
             pid,
-            created_at: Utc::now(),
+            created_at: now,
+            last_heartbeat: Some(now),
         };
 
         let path = format!("locks/{}", lock_id);
@@ -208,8 +248,11 @@ impl RepositoryLock {
         for key in keys {
             if let Ok(data) = backend.get_object(&key).await {
                 if let Ok(info) = serde_json::from_slice::<LockInfo>(&data) {
-                    // Consider locks older than 2 hours stale
-                    if now.signed_duration_since(info.created_at) < Duration::hours(2) {
+                    let is_active = match info.last_heartbeat {
+                        Some(hb) => now.signed_duration_since(hb) < Duration::minutes(15),
+                        None => now.signed_duration_since(info.created_at) < Duration::hours(2),
+                    };
+                    if is_active {
                         active.push(info);
                     }
                 }
@@ -229,13 +272,30 @@ impl RepositoryLock {
 
         for key in keys {
             if let Ok(data) = backend.get_object(&key).await {
-                if let Ok(info) = serde_json::from_slice::<LockInfo>(&data) {
-                    let is_stale = now.signed_duration_since(info.created_at) >= Duration::hours(2);
-                    if is_stale || force {
-                        let _ = backend.delete_object(&key).await;
-                        removed += 1;
+                match serde_json::from_slice::<LockInfo>(&data) {
+                    Ok(info) => {
+                        let is_stale = match info.last_heartbeat {
+                            Some(hb) => now.signed_duration_since(hb) >= Duration::minutes(15),
+                            None => {
+                                now.signed_duration_since(info.created_at) >= Duration::hours(2)
+                            }
+                        };
+                        if is_stale || force {
+                            let _ = backend.delete_object(&key).await;
+                            removed += 1;
+                        }
+                    }
+                    Err(_) => {
+                        // Corrupted lock file: if --force is requested, remove it
+                        if force {
+                            let _ = backend.delete_object(&key).await;
+                            removed += 1;
+                        }
                     }
                 }
+            } else if force {
+                let _ = backend.delete_object(&key).await;
+                removed += 1;
             }
         }
 
