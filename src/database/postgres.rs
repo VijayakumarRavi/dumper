@@ -555,11 +555,17 @@ impl DatabaseAdapter for PostgresAdapter {
         // 8. Secondary Indexes
         let index_rows = client
             .query(
-                "SELECT schemaname, tablename, indexname, indexdef \
-                 FROM pg_indexes \
-                 WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
-                   AND indexname NOT LIKE '%_pkey' \
-                 ORDER BY schemaname, tablename, indexname",
+                "SELECT n.nspname, c.relname, i.relname, pg_get_indexdef(i.oid) \
+                 FROM pg_index x \
+                 JOIN pg_class c ON c.oid = x.indrelid \
+                 JOIN pg_class i ON i.oid = x.indexrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+                   AND n.nspname NOT LIKE 'pg_temp_%' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid \
+                   ) \
+                 ORDER BY n.nspname, c.relname, i.relname",
                 &[],
             )
             .await
