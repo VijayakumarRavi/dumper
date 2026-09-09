@@ -369,7 +369,7 @@ async fn test_s3_missing_blob_and_corrupt_snapshot_detection() {
     );
 
     // 2. Corrupt snapshot metadata file
-    let corrupt_snap_path = format!("snapshots/corrupt_snap.json");
+    let corrupt_snap_path = "snapshots/corrupt_snap.json".to_string();
     s3_backend
         .put_object(&corrupt_snap_path, b"NOT_VALID_ENCRYPTED_OR_JSON_DATA")
         .await
