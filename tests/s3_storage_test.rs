@@ -457,7 +457,10 @@ async fn test_repository_large_object_count_1000_blobs() {
     let mut all_blob_refs = Vec::with_capacity(BLOB_COUNT);
 
     for i in 0..BLOB_COUNT {
-        let content = format!("Unique payload chunk for object index {:05} with padding...", i);
+        let content = format!(
+            "Unique payload chunk for object index {:05} with padding...",
+            i
+        );
         let hash = hex::encode(Sha256::digest(content.as_bytes()));
         let (r, _) = engine
             .put_chunk(content.as_bytes(), &hash, CompressionLevel::Fast)
@@ -529,7 +532,10 @@ async fn test_repository_large_object_count_1000_blobs() {
 
     // Prune should delete exactly 500 unreferenced blobs (blobs 0..500)
     let (pruned_blobs, pruned_bytes) = engine.prune().await.unwrap();
-    assert_eq!(pruned_blobs, 500, "Prune must remove exactly 500 dereferenced blobs");
+    assert_eq!(
+        pruned_blobs, 500,
+        "Prune must remove exactly 500 dereferenced blobs"
+    );
     assert!(pruned_bytes > 0, "Prune must report positive bytes freed");
 
     // Check after prune: 1 snapshot remaining, 500 live blobs, 0 missing, 0 orphans

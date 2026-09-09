@@ -256,7 +256,10 @@ async fn test_backup_exceeds_lock_ttl_with_heartbeat_renewal() {
     let cleaned = RepositoryLock::unlock_all(backend.as_ref(), false)
         .await
         .unwrap();
-    assert_eq!(cleaned, 0, "Active lock with fresh heartbeat must not be cleaned up");
+    assert_eq!(
+        cleaned, 0,
+        "Active lock with fresh heartbeat must not be cleaned up"
+    );
 
     // 4. Now simulate process crash / heartbeat abandoned: last_heartbeat is older than 15-minute TTL
     let stale_lock_info = LockInfo {
@@ -284,7 +287,10 @@ async fn test_backup_exceeds_lock_ttl_with_heartbeat_renewal() {
     let cleaned_stale = RepositoryLock::unlock_all(backend.as_ref(), false)
         .await
         .unwrap();
-    assert_eq!(cleaned_stale, 1, "Stale lock must be reclaimed by unlock_all");
+    assert_eq!(
+        cleaned_stale, 1,
+        "Stale lock must be reclaimed by unlock_all"
+    );
 
     // Exclusive lock can now be acquired
     let mut exclusive_success = RepositoryLock::acquire(backend.clone(), LockType::Exclusive)
@@ -326,7 +332,8 @@ async fn test_concurrent_backup_and_prune_mutual_exclusion() {
     );
     let err_msg = prune_attempt.err().unwrap().to_string();
     assert!(
-        err_msg.contains("Repository is locked by") || err_msg.contains("Concurrent lock acquisition"),
+        err_msg.contains("Repository is locked by")
+            || err_msg.contains("Concurrent lock acquisition"),
         "Error should indicate repository lock conflict, got: {}",
         err_msg
     );

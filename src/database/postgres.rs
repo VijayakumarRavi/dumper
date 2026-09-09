@@ -165,7 +165,9 @@ impl PostgresAdapter {
 
     /// Queries `pg_stat_ssl` to verify whether the active connection is encrypted with TLS,
     /// returning `(ssl_active, tls_version, tls_cipher)`.
-    pub async fn query_ssl_stat(&self) -> Result<(bool, Option<String>, Option<String>), DumperError> {
+    pub async fn query_ssl_stat(
+        &self,
+    ) -> Result<(bool, Option<String>, Option<String>), DumperError> {
         let client = self.connect().await?;
         let row = client
             .query_one(
