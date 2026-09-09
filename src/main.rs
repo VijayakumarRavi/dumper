@@ -7,7 +7,7 @@ use dumper::repository::engine::RepositoryEngine;
 use dumper::repository::local::LocalBackend;
 use dumper::repository::lock::{LockType, RepositoryLock};
 use dumper::repository::s3::client::S3Client;
-use dumper::repository::snapshot::{BlobReference, SnapshotMetadata};
+use dumper::repository::snapshot::SnapshotMetadata;
 use dumper::retention::evaluate_retention;
 use dumper::stats::{compute_stats, print_stats_table};
 use dumper::stream::decoder::StreamDecoder;
@@ -187,7 +187,7 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
 
                 use tokio::io::AsyncReadExt;
                 loop {
-                    let mut remaining = chunk_size - chunk_bytes_read;
+                    let remaining = chunk_size - chunk_bytes_read;
                     if remaining == 0 {
                         let hash_bytes = sha2::Sha256::digest(&buffer);
                         let hash_hex = hex::encode(hash_bytes);
@@ -203,7 +203,6 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                         stored_blobs.push(blob_ref);
 
                         chunk_bytes_read = 0;
-                        remaining = chunk_size;
                     }
 
                     let n = reader
@@ -234,12 +233,32 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                 Ok::<_, DumperError>((stored_blobs, total_stored_bytes, total_dedup_bytes))
             });
 
-            let backup_stats = db_adapter.backup(&mut encoder).await?;
-            let (logical_bytes, _) = encoder.finish().await?;
+            let backup_res = db_adapter.backup(&mut encoder).await;
+            let finish_res = if backup_res.is_ok() {
+                encoder.finish().await
+            } else {
+                drop(encoder);
+                Ok((0, String::new()))
+            };
 
-            let (stored_blobs, total_stored_bytes, total_dedup_bytes) = upload_handle
-                .await
-                .map_err(|e| DumperError::Repository(format!("Upload task panicked: {}", e)))??;
+            let upload_res = upload_handle.await;
+
+            // Prioritize upload task error over downstream broken pipe database errors so root cause is reported
+            let (stored_blobs, total_stored_bytes, total_dedup_bytes) = match upload_res {
+                Ok(Ok(val)) => val,
+                Ok(Err(upload_err)) => {
+                    return Err(upload_err);
+                }
+                Err(join_err) => {
+                    return Err(DumperError::Repository(format!(
+                        "Upload task panicked: {}",
+                        join_err
+                    )));
+                }
+            };
+
+            let backup_stats = backup_res?;
+            let (logical_bytes, _) = finish_res?;
 
             let completed_time = chrono::Utc::now();
             let duration_seconds = (completed_time - start_time).num_seconds().max(0) as u64;
