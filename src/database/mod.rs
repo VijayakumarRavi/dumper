@@ -6,6 +6,7 @@ use crate::stream::encoder::StreamEncoder;
 pub mod mysql;
 pub mod postgres;
 
+#[derive(Debug, Clone)]
 pub struct DatabaseMeta {
     pub engine: String,
     pub database: String,
@@ -13,6 +14,7 @@ pub struct DatabaseMeta {
     pub table_names: Vec<(String, String)>, // (schema, table)
 }
 
+#[derive(Debug, Clone)]
 pub struct BackupStats {
     pub engine: String,
     pub database: String,
@@ -22,11 +24,13 @@ pub struct BackupStats {
     pub logical_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
 pub struct RestoreOptions {
     pub target_database_override: Option<String>,
     pub drop_existing: bool,
 }
 
+#[derive(Debug, Clone)]
 pub struct RestoreStats {
     pub tables_restored: usize,
     pub records_processed: u64,

@@ -513,13 +513,28 @@ impl DatabaseAdapter for PostgresAdapter {
                         "SELECT setval('\"{}\".\"{}\"', {}, {});",
                         seq.schema_name, seq.sequence_name, seq.last_value, seq.is_called
                     );
-                    let _ = client.batch_execute(&setval_sql).await;
+                    client.batch_execute(&setval_sql).await.map_err(|e| {
+                        DumperError::Restore(format!(
+                            "Failed to update sequence {}.{}: {}",
+                            seq.schema_name, seq.sequence_name, e
+                        ))
+                    })?;
                 }
                 StreamRecord::PostData(post) => {
-                    let _ = client.batch_execute(&post.sql).await;
+                    client.batch_execute(&post.sql).await.map_err(|e| {
+                        DumperError::Restore(format!(
+                            "Failed to execute post-data constraint/index '{}': {}",
+                            post.name, e
+                        ))
+                    })?;
                 }
                 StreamRecord::Routine(routine) => {
-                    let _ = client.batch_execute(&routine.sql).await;
+                    client.batch_execute(&routine.sql).await.map_err(|e| {
+                        DumperError::Restore(format!(
+                            "Failed to execute routine SQL for '{}': {}",
+                            routine.name, e
+                        ))
+                    })?;
                 }
                 StreamRecord::Trailer(_) => {
                     break;
