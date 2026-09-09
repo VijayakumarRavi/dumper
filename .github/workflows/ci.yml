@@ -102,7 +102,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -133,16 +133,6 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
-      minio:
-        image: minio/minio:latest
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        ports:
-          - 9000:9000
-        options: >-
-          server /data
-
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -154,13 +144,24 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-client mysql-client curl
 
+      - name: Start MinIO Server
+        run: |
+          mkdir -p /tmp/minio_data/test-bucket
+          docker run -d --name minio -p 9000:9000 \
+            -v /tmp/minio_data:/data \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in {1..30}; do
+            if curl -s -f http://127.0.0.1:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
       - name: Build Dumper Release Binary
         run: cargo build --release
-
-      - name: Setup MinIO Bucket
-        run: |
-          # Create test bucket
-          curl -s -X PUT -u minioadmin:minioadmin http://127.0.0.1:9000/test-bucket || true
 
       - name: PostgreSQL E2E (Local Repo) - Deep Data & Schema Compare
         run: |
