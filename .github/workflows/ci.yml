@@ -90,7 +90,7 @@ jobs:
         run: cargo test -r --all-targets --workspace
 
   real-e2e:
-    name: Real Services E2E (Postgres, MySQL, MariaDB, S3, Local)
+    name: Real Services E2E (Deep Schema & Data Comparison)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -152,139 +152,90 @@ jobs:
       - name: Install Database Client Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-client mysql-client
+          sudo apt-get install -y -qq postgresql-client mysql-client curl
 
       - name: Build Dumper Release Binary
         run: cargo build --release
 
-      - name: E2E Test - Local Filesystem Repository
+      - name: Setup MinIO Bucket
+        run: |
+          # Create test bucket
+          curl -s -X PUT -u minioadmin:minioadmin http://127.0.0.1:9000/test-bucket || true
+
+      - name: PostgreSQL E2E (Local Repo) - Deep Data & Schema Compare
         run: |
           export DUMPER_PASSWORD="local-repo-password"
-          REPO="/tmp/dumper-local-repo"
-          ./target/release/dumper -r "$REPO" init
+          ./scripts/ci/test-e2e-postgres.sh \
+            "postgres://postgres:testpassword@127.0.0.1:5432/e2e_pg" \
+            "/tmp/dumper-local-pg-repo" \
+            "./target/release/dumper"
 
-          # Create test table in PostgreSQL
-          PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d e2e_pg -c \
-            "CREATE TABLE IF NOT EXISTS local_test (id serial primary key, note text, created_at timestamp default now());"
-          PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d e2e_pg -c \
-            "INSERT INTO local_test (note) VALUES ('local-test-row-1'), ('local-test-row-2');"
-
-          # Backup to Local Repo
-          ./target/release/dumper -r "$REPO" backup "postgres://postgres:testpassword@127.0.0.1:5432/e2e_pg" --tag "local-test"
-          
-          # List snapshots and verify
-          SNAPSHOT_ID=$(./target/release/dumper -r "$REPO" --json snapshots | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
-          ./target/release/dumper -r "$REPO" verify "$SNAPSHOT_ID" --restore-test
-          ./target/release/dumper -r "$REPO" check
-          ./target/release/dumper -r "$REPO" stats
-
-          # Drop and restore
-          PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d e2e_pg -c "DROP TABLE local_test;"
-          ./target/release/dumper -r "$REPO" restore "$SNAPSHOT_ID" --target "postgres://postgres:testpassword@127.0.0.1:5432/e2e_pg"
-          
-          # Verify rows restored
-          ROWS=$(PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d e2e_pg -tAc "SELECT count(*) FROM local_test;")
-          [ "$ROWS" -eq 2 ] || exit 1
-
-      - name: E2E Test - Real MinIO / S3 Repository
+      - name: PostgreSQL E2E (MinIO S3) - Deep Data & Schema Compare
         run: |
           export DUMPER_PASSWORD="s3-repo-password"
           export DUMPER_S3_ENDPOINT="http://127.0.0.1:9000"
           export DUMPER_S3_ACCESS_KEY_ID="minioadmin"
           export DUMPER_S3_SECRET_ACCESS_KEY="minioadmin"
-          export DUMPER_REPOSITORY="s3://test-bucket/backups"
-
-          # Pre-create bucket in MinIO
-          mkdir -p /tmp/minio-dummy && touch /tmp/minio-dummy/init
-          curl -s -X PUT -u minioadmin:minioadmin http://127.0.0.1:9000/test-bucket || true
-
-          # Initialize S3 repository
+          export DUMPER_REPOSITORY="s3://test-bucket/backups/pg"
           ./target/release/dumper init
+          ./scripts/ci/test-e2e-postgres.sh \
+            "postgres://postgres:testpassword@127.0.0.1:5432/e2e_pg" \
+            "s3://test-bucket/backups/pg" \
+            "./target/release/dumper"
 
-          # Populate PostgreSQL data
-          PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d e2e_pg -c \
-            "CREATE TABLE IF NOT EXISTS s3_test (id serial primary key, payload text);"
-          PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d e2e_pg -c \
-            "INSERT INTO s3_test (payload) VALUES ('s3-data-1'), ('s3-data-2'), ('s3-data-3');"
-
-          # Backup to S3
-          ./target/release/dumper backup "postgres://postgres:testpassword@127.0.0.1:5432/e2e_pg" --tag "s3-test"
-          
-          # Verify S3 snapshot
-          S3_SNAP=$(./target/release/dumper --json snapshots | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
-          ./target/release/dumper verify "$S3_SNAP" --restore-test
-          ./target/release/dumper check
-          ./target/release/dumper stats
-
-          # Drop and restore from S3
-          PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d e2e_pg -c "DROP TABLE s3_test;"
-          ./target/release/dumper restore "$S3_SNAP" --target "postgres://postgres:testpassword@127.0.0.1:5432/e2e_pg"
-
-          # Validate row count
-          COUNT=$(PGPASSWORD=testpassword psql -h 127.0.0.1 -U postgres -d e2e_pg -tAc "SELECT count(*) FROM s3_test;")
-          [ "$COUNT" -eq 3 ] || exit 1
-
-      - name: E2E Test - Real MySQL 8.0 Backup + Restore
+      - name: MySQL 8.0 E2E (Local Repo) - Deep Data & Schema Compare
         run: |
-          export DUMPER_PASSWORD="mysql-repo-password"
-          REPO="/tmp/dumper-mysql-repo"
-          ./target/release/dumper -r "$REPO" init
+          export DUMPER_PASSWORD="local-repo-password"
+          ./scripts/ci/test-e2e-mysql.sh \
+            "mysql://root:testpassword@127.0.0.1:3306/e2e_mysql" \
+            "/tmp/dumper-local-mysql-repo" \
+            "mysql" \
+            "./target/release/dumper"
 
-          # Populate MySQL 8.0
-          mysql -h 127.0.0.1 -P 3306 -u root -ptestpassword e2e_mysql -e \
-            "CREATE TABLE mysql8_users (id INT AUTO_INCREMENT PRIMARY KEY, username VARCHAR(50), balance DECIMAL(10,2));"
-          mysql -h 127.0.0.1 -P 3306 -u root -ptestpassword e2e_mysql -e \
-            "INSERT INTO mysql8_users (username, balance) VALUES ('alice', 100.50), ('bob', 250.75), ('carol', 12.00);"
-
-          # Backup
-          ./target/release/dumper -r "$REPO" backup "mysql://root:testpassword@127.0.0.1:3306/e2e_mysql" --tag "mysql8-test"
-          
-          # Verify snapshot
-          SNAP=$(./target/release/dumper -r "$REPO" --json snapshots | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
-          ./target/release/dumper -r "$REPO" verify "$SNAP" --restore-test
-
-          # Drop table
-          mysql -h 127.0.0.1 -P 3306 -u root -ptestpassword e2e_mysql -e "DROP TABLE mysql8_users;"
-
-          # Restore
-          ./target/release/dumper -r "$REPO" restore "$SNAP" --target "mysql://root:testpassword@127.0.0.1:3306/e2e_mysql"
-
-          # Validate
-          USER_COUNT=$(mysql -h 127.0.0.1 -P 3306 -u root -ptestpassword -N -s -e "SELECT count(*) FROM e2e_mysql.mysql8_users;")
-          [ "$USER_COUNT" -eq 3 ] || exit 1
-
-      - name: E2E Test - Real MariaDB 11.4 Backup + Restore
+      - name: MySQL 8.0 E2E (MinIO S3) - Deep Data & Schema Compare
         run: |
-          export DUMPER_PASSWORD="mariadb-repo-password"
-          REPO="/tmp/dumper-mariadb-repo"
-          ./target/release/dumper -r "$REPO" init
+          export DUMPER_PASSWORD="s3-repo-password"
+          export DUMPER_S3_ENDPOINT="http://127.0.0.1:9000"
+          export DUMPER_S3_ACCESS_KEY_ID="minioadmin"
+          export DUMPER_S3_SECRET_ACCESS_KEY="minioadmin"
+          export DUMPER_REPOSITORY="s3://test-bucket/backups/mysql"
+          ./target/release/dumper init
+          ./scripts/ci/test-e2e-mysql.sh \
+            "mysql://root:testpassword@127.0.0.1:3306/e2e_mysql" \
+            "s3://test-bucket/backups/mysql" \
+            "mysql" \
+            "./target/release/dumper"
 
-          # Populate MariaDB 11.4
-          mysql -h 127.0.0.1 -P 3307 -u root -ptestpassword e2e_mariadb -e \
-            "CREATE TABLE mariadb_orders (order_id INT AUTO_INCREMENT PRIMARY KEY, item VARCHAR(100), qty INT);"
-          mysql -h 127.0.0.1 -P 3307 -u root -ptestpassword e2e_mariadb -e \
-            "INSERT INTO mariadb_orders (item, qty) VALUES ('laptop', 2), ('monitor', 5), ('keyboard', 10);"
+      - name: MariaDB 11.4 E2E (Local Repo) - Deep Data & Schema Compare
+        run: |
+          export DUMPER_PASSWORD="local-repo-password"
+          ./scripts/ci/test-e2e-mysql.sh \
+            "mysql://root:testpassword@127.0.0.1:3307/e2e_mariadb" \
+            "/tmp/dumper-local-mariadb-repo" \
+            "mysql" \
+            "./target/release/dumper"
 
-          # Backup
-          ./target/release/dumper -r "$REPO" backup "mysql://root:testpassword@127.0.0.1:3307/e2e_mariadb" --tag "mariadb11-test"
-          
-          # Verify snapshot
-          SNAP=$(./target/release/dumper -r "$REPO" --json snapshots | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
-          ./target/release/dumper -r "$REPO" verify "$SNAP" --restore-test
+      - name: MariaDB 11.4 E2E (MinIO S3) - Deep Data & Schema Compare
+        run: |
+          export DUMPER_PASSWORD="s3-repo-password"
+          export DUMPER_S3_ENDPOINT="http://127.0.0.1:9000"
+          export DUMPER_S3_ACCESS_KEY_ID="minioadmin"
+          export DUMPER_S3_SECRET_ACCESS_KEY="minioadmin"
+          export DUMPER_REPOSITORY="s3://test-bucket/backups/mariadb"
+          ./target/release/dumper init
+          ./scripts/ci/test-e2e-mysql.sh \
+            "mysql://root:testpassword@127.0.0.1:3307/e2e_mariadb" \
+            "s3://test-bucket/backups/mariadb" \
+            "mysql" \
+            "./target/release/dumper"
 
-          # Drop table
-          mysql -h 127.0.0.1 -P 3307 -u root -ptestpassword e2e_mariadb -e "DROP TABLE mariadb_orders;"
-
-          # Restore
-          ./target/release/dumper -r "$REPO" restore "$SNAP" --target "mysql://root:testpassword@127.0.0.1:3307/e2e_mariadb"
-
-          # Validate
-          ORDER_COUNT=$(mysql -h 127.0.0.1 -P 3307 -u root -ptestpassword -N -s -e "SELECT count(*) FROM e2e_mariadb.mariadb_orders;")
-          [ "$ORDER_COUNT" -eq 3 ] || exit 1
-
-          # Test forget and prune
-          ./target/release/dumper -r "$REPO" forget --keep-last 1 --prune
-          ./target/release/dumper -r "$REPO" check
+      - name: Repository Lifecycle & Pruning Verification
+        run: |
+          export DUMPER_PASSWORD="local-repo-password"
+          ./target/release/dumper -r "/tmp/dumper-local-pg-repo" snapshots
+          ./target/release/dumper -r "/tmp/dumper-local-pg-repo" stats
+          ./target/release/dumper -r "/tmp/dumper-local-pg-repo" forget --keep-last 1 --prune
+          ./target/release/dumper -r "/tmp/dumper-local-pg-repo" check
 
   docs:
     name: Build docs
