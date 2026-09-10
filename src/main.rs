@@ -48,6 +48,7 @@ async fn main() {
 
     if let Err(err) = run(cli, &reporter).await {
         let code = err.exit_code();
+        RepositoryLock::cleanup_all_active().await;
         if reporter_is_json() {
             let event = ProgressEvent {
                 event: "error",
@@ -529,20 +530,17 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                 for s in plan.remove {
                     engine.delete_snapshot(&s.id).await?;
                 }
-                lock.release().await?;
 
                 if args.prune {
                     reporter.log_info("Pruning unreferenced blobs...");
-                    let mut prune_lock =
-                        RepositoryLock::acquire(backend.clone(), LockType::Exclusive).await?;
                     let (deleted_count, deleted_bytes) = engine.prune().await?;
-                    prune_lock.release().await?;
                     reporter.log_info(&format!(
                         "Pruned {} unreferenced blob(s) ({})",
                         deleted_count,
                         format_bytes(deleted_bytes)
                     ));
                 }
+                lock.release().await?;
             }
 
             Ok(())

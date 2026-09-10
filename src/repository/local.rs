@@ -26,15 +26,37 @@ impl LocalBackend {
     }
 
     fn resolve_path(&self, rel_path: &str) -> Result<PathBuf, DumperError> {
-        // Prevent path traversal
-        let clean_rel = rel_path.trim_start_matches('/');
-        if clean_rel.contains("..") {
+        // Prevent path traversal across Unix and Windows
+        let p = Path::new(rel_path);
+        if rel_path.starts_with('/')
+            || rel_path.starts_with('\\')
+            || rel_path.contains(':')
+            || rel_path.contains("..")
+            || p.is_absolute()
+            || p.has_root()
+            || p.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                )
+            })
+        {
             return Err(DumperError::Repository(format!(
                 "Path traversal attempt detected: '{}'",
                 rel_path
             )));
         }
-        Ok(self.base_path.join(clean_rel))
+
+        let joined = self.base_path.join(rel_path);
+        if !joined.starts_with(&self.base_path) {
+            return Err(DumperError::Repository(format!(
+                "Path traversal attempt detected: '{}'",
+                rel_path
+            )));
+        }
+        Ok(joined)
     }
 }
 
@@ -69,12 +91,23 @@ impl StorageBackend for LocalBackend {
 
             drop(file);
 
-            fs::rename(&tmp_path, &target_path).await.map_err(|e| {
-                DumperError::Repository(format!(
-                    "Failed to rename temp file {:?} to {:?}: {}",
-                    tmp_path, target_path, e
-                ))
-            })?;
+            if let Err(rename_err) = fs::rename(&tmp_path, &target_path).await {
+                // On Windows, rename fails if target already exists. Remove and retry.
+                if fs::try_exists(&target_path).await.unwrap_or(false) {
+                    let _ = fs::remove_file(&target_path).await;
+                    fs::rename(&tmp_path, &target_path).await.map_err(|e| {
+                        DumperError::Repository(format!(
+                            "Failed to rename temp file {:?} to {:?}: {}",
+                            tmp_path, target_path, e
+                        ))
+                    })?;
+                } else {
+                    return Err(DumperError::Repository(format!(
+                        "Failed to rename temp file {:?} to {:?}: {}",
+                        tmp_path, target_path, rename_err
+                    )));
+                }
+            }
 
             Ok::<(), DumperError>(())
         }
@@ -265,9 +298,29 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
 
-        let malicious = "../../../etc/passwd";
-        let res = backend.put_object(malicious, b"danger").await;
-        assert!(res.is_err());
+        let malicious_paths = [
+            "../../../etc/passwd",
+            "..\\..\\..\\windows\\system32",
+            "/etc/passwd",
+            "\\windows\\system32",
+            "C:\\test\\file",
+            "C:test\\file",
+            "\\\\server\\share\\test",
+        ];
+        for malicious in malicious_paths {
+            let res = backend.put_object(malicious, b"danger").await;
+            assert!(res.is_err(), "Expected error for path: {}", malicious);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_existing_object() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+
+        backend.put_object("blobs/test", b"version 1").await.unwrap();
+        backend.put_object("blobs/test", b"version 2").await.unwrap();
+        assert_eq!(backend.get_object("blobs/test").await.unwrap(), b"version 2");
     }
 
     #[tokio::test]
