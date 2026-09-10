@@ -2,8 +2,11 @@ use dumper::repository::engine::RepositoryEngine;
 use dumper::repository::lock::{LockType, RepositoryLock};
 use tempfile::tempdir;
 
+static TEST_LOCK_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn test_lock_exclusion() {
+    let _test_guard = TEST_LOCK_MUTEX.lock().await;
     let dir = tempdir().unwrap();
     let backend = std::sync::Arc::new(
         dumper::repository::local::LocalBackend::new(dir.path().to_str().unwrap())
@@ -54,6 +57,7 @@ async fn test_lock_exclusion() {
 
 #[tokio::test]
 async fn test_lock_raii_guard_drop_cleanup() {
+    let _test_guard = TEST_LOCK_MUTEX.lock().await;
     let dir = tempdir().unwrap();
     let backend = std::sync::Arc::new(
         dumper::repository::local::LocalBackend::new(dir.path().to_str().unwrap())
@@ -89,6 +93,7 @@ async fn test_lock_raii_guard_drop_cleanup() {
 
 #[tokio::test]
 async fn test_lock_cleanup_all_active_signal_safety() {
+    let _test_guard = TEST_LOCK_MUTEX.lock().await;
     let dir = tempdir().unwrap();
     let backend = std::sync::Arc::new(
         dumper::repository::local::LocalBackend::new(dir.path().to_str().unwrap())
@@ -132,6 +137,7 @@ async fn test_lock_cleanup_all_active_signal_safety() {
 
 #[tokio::test]
 async fn test_lock_heartbeat_renewal() {
+    let _test_guard = TEST_LOCK_MUTEX.lock().await;
     let dir = tempdir().unwrap();
     let backend = std::sync::Arc::new(
         dumper::repository::local::LocalBackend::new(dir.path().to_str().unwrap())
@@ -174,6 +180,7 @@ async fn test_lock_heartbeat_renewal() {
 
 #[tokio::test]
 async fn test_corrupted_lock_file_unlock_force() {
+    let _test_guard = TEST_LOCK_MUTEX.lock().await;
     let dir = tempdir().unwrap();
     let backend = std::sync::Arc::new(
         dumper::repository::local::LocalBackend::new(dir.path().to_str().unwrap())
@@ -211,6 +218,7 @@ async fn test_corrupted_lock_file_unlock_force() {
 
 #[tokio::test]
 async fn test_backup_exceeds_lock_ttl_with_heartbeat_renewal() {
+    let _test_guard = TEST_LOCK_MUTEX.lock().await;
     use chrono::{Duration as ChronoDuration, Utc};
     use dumper::repository::backend::StorageBackend;
     use dumper::repository::lock::LockInfo;
@@ -301,6 +309,7 @@ async fn test_backup_exceeds_lock_ttl_with_heartbeat_renewal() {
 
 #[tokio::test]
 async fn test_concurrent_backup_and_prune_mutual_exclusion() {
+    let _test_guard = TEST_LOCK_MUTEX.lock().await;
     let dir = tempdir().unwrap();
     let backend = std::sync::Arc::new(
         dumper::repository::local::LocalBackend::new(dir.path().to_str().unwrap())

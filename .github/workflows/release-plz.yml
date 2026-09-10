@@ -22,9 +22,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz
-        # Requires repository setting: "Allow GitHub Actions to create and approve pull requests"
-        # or a Personal Access Token configured in RELEASE_PLZ_TOKEN.
+        id: release-plz
+        continue-on-error: true
         uses: release-plz/action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Check release-plz outcome
+        if: steps.release-plz.outcome == 'failure'
+        run: |
+          if [ -n "${{ secrets.RELEASE_PLZ_TOKEN }}" ]; then
+            echo "::error::release-plz failed with configured RELEASE_PLZ_TOKEN"
+            exit 1
+          else
+            echo "::warning::release-plz could not open PR with default GITHUB_TOKEN (likely 'Allow GitHub Actions to create and approve pull requests' is not enabled in repository Settings -> Actions -> General). To enable automated release PRs, enable that repository setting or provide RELEASE_PLZ_TOKEN."
+          fi
