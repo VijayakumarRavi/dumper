@@ -14,6 +14,16 @@ pub struct PostgresAdapter {
     url: String,
 }
 
+/// Quotes a PostgreSQL identifier using double quotes with internal double quotes doubled.
+pub fn quote_pg_identifier(id: &str) -> String {
+    format!("\"{}\"", id.replace('"', "\"\""))
+}
+
+/// Quotes a PostgreSQL literal string using single quotes with internal single quotes doubled.
+pub fn quote_pg_literal(val: &str) -> String {
+    format!("'{}'", val.replace('\'', "''"))
+}
+
 #[derive(Debug)]
 struct NoCertificateVerification(std::sync::Arc<rustls::crypto::CryptoProvider>);
 
@@ -250,20 +260,57 @@ impl DatabaseAdapter for PostgresAdapter {
                 ))
             })?;
 
-        let meta = self.inspect().await?;
+        // 2. Query server metadata and table list within the snapshot transaction
+        let version_row = client
+            .query_one("SELECT version()", &[])
+            .await
+            .map_err(|e| DumperError::Database(e.to_string()))?;
+        let full_version: String = version_row.get(0);
+        let server_version = full_version
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
 
-        // 2. Stream Header
+        let db_row = client
+            .query_one("SELECT current_database()", &[])
+            .await
+            .map_err(|e| DumperError::Database(e.to_string()))?;
+        let database: String = db_row.get(0);
+
+        let table_rows = client
+            .query(
+                "SELECT n.nspname, c.relname \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind = 'r' \
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+                   AND n.nspname NOT LIKE 'pg_temp_%' \
+                 ORDER BY n.nspname, c.relname",
+                &[],
+            )
+            .await
+            .map_err(|e| DumperError::Database(e.to_string()))?;
+
+        let mut table_names = Vec::new();
+        for row in table_rows {
+            let schema: String = row.get(0);
+            let table: String = row.get(1);
+            table_names.push((schema, table));
+        }
+
+        // 3. Stream Header
         let header = StreamHeader {
             version: STREAM_VERSION,
-            engine: meta.engine.clone(),
-            database: meta.database.clone(),
-            server_version: meta.server_version.clone(),
+            engine: "postgresql".into(),
+            database: database.clone(),
+            server_version: server_version.clone(),
             dumper_version: env!("CARGO_PKG_VERSION").into(),
             start_time: chrono::Utc::now().timestamp(),
         };
         encoder.write_record(&StreamRecord::Header(header)).await?;
 
-        // 3. User Schemas
+        // 4. User Schemas
         let schema_rows = client
             .query(
                 "SELECT nspname FROM pg_namespace \
@@ -281,7 +328,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 encoder
                     .write_record(&StreamRecord::PreData(PreDataRecord {
                         name: schema.clone(),
-                        sql: format!("CREATE SCHEMA IF NOT EXISTS \"{}\";", schema),
+                        sql: format!("CREATE SCHEMA IF NOT EXISTS {};", quote_pg_identifier(&schema)),
                     }))
                     .await?;
             }
@@ -355,7 +402,7 @@ impl DatabaseAdapter for PostgresAdapter {
         let mut tables_backed_up = 0;
         let total_rows = 0u64;
 
-        for (schema, table) in &meta.table_names {
+        for (schema, table) in &table_names {
             // Columns metadata
             let col_rows = client
                 .query(
@@ -385,7 +432,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 let is_nullable: bool = crow.get(2);
                 let default_val: Option<String> = crow.get(3);
 
-                let mut def = format!("\"{}\" {}", col_name, data_type);
+                let mut def = format!("{} {}", quote_pg_identifier(&col_name), data_type);
                 if !is_nullable {
                     def.push_str(" NOT NULL");
                 }
@@ -403,9 +450,9 @@ impl DatabaseAdapter for PostgresAdapter {
             }
 
             let create_sql = format!(
-                "CREATE TABLE IF NOT EXISTS \"{}\".\"{}\" ({});",
-                schema,
-                table,
+                "CREATE TABLE IF NOT EXISTS {}.{} ({});",
+                quote_pg_identifier(schema),
+                quote_pg_identifier(table),
                 col_defs.join(", ")
             );
 
@@ -420,8 +467,9 @@ impl DatabaseAdapter for PostgresAdapter {
 
             // Stream COPY Data directly
             let copy_sql = format!(
-                "COPY \"{}\".\"{}\" TO STDOUT (FORMAT binary)",
-                schema, table
+                "COPY {}.{} TO STDOUT (FORMAT binary)",
+                quote_pg_identifier(schema),
+                quote_pg_identifier(table)
             );
             let copy_out = client.copy_out(&copy_sql).await.map_err(|e| {
                 DumperError::Database(format!("COPY OUT failed for {}.{}: {}", schema, table, e))
@@ -477,8 +525,9 @@ impl DatabaseAdapter for PostgresAdapter {
             let schema: String = srow.get(0);
             let seq: String = srow.get(1);
             let seq_val_sql = format!(
-                "SELECT last_value, is_called FROM \"{}\".\"{}\"",
-                schema, seq
+                "SELECT last_value, is_called FROM {}.{}",
+                quote_pg_identifier(&schema),
+                quote_pg_identifier(&seq)
             );
             let val_row = client.query_one(&seq_val_sql, &[]).await.map_err(|e| {
                 DumperError::Database(format!(
@@ -519,13 +568,17 @@ impl DatabaseAdapter for PostgresAdapter {
             let relkind: i8 = vrow.get(3);
             let sql = if relkind == b'm' as i8 {
                 format!(
-                    "CREATE MATERIALIZED VIEW \"{}\".\"{}\" AS {}",
-                    schema, view_name, view_def
+                    "CREATE MATERIALIZED VIEW {}.{} AS {}",
+                    quote_pg_identifier(&schema),
+                    quote_pg_identifier(&view_name),
+                    view_def
                 )
             } else {
                 format!(
-                    "CREATE OR REPLACE VIEW \"{}\".\"{}\" AS {}",
-                    schema, view_name, view_def
+                    "CREATE OR REPLACE VIEW {}.{} AS {}",
+                    quote_pg_identifier(&schema),
+                    quote_pg_identifier(&view_name),
+                    view_def
                 )
             };
             let r_type = if relkind == b'm' as i8 {
@@ -672,9 +725,9 @@ impl DatabaseAdapter for PostgresAdapter {
         let _ = client.batch_execute("COMMIT;").await;
 
         Ok(BackupStats {
-            engine: meta.engine,
-            database: meta.database,
-            server_version: meta.server_version,
+            engine: "postgresql".into(),
+            database,
+            server_version,
             tables_backed_up,
             rows_backed_up: total_rows,
             logical_bytes: encoder.bytes_written(),
@@ -720,8 +773,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 StreamRecord::TableSchema(s) => {
                     if options.drop_existing {
                         let drop_sql = format!(
-                            "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE;",
-                            s.schema_name, s.table_name
+                            "DROP TABLE IF EXISTS {}.{} CASCADE;",
+                            quote_pg_identifier(&s.schema_name),
+                            quote_pg_identifier(&s.table_name)
                         );
                         let _ = client.batch_execute(&drop_sql).await;
                     }
@@ -757,19 +811,30 @@ impl DatabaseAdapter for PostgresAdapter {
                         None => true,
                     };
 
-                    if needs_new_sink && !d.is_last {
-                        let copy_sql = format!(
-                            "COPY \"{}\".\"{}\" FROM STDIN (FORMAT binary)",
-                            d.schema_name, d.table_name
-                        );
-                        let sink = Box::pin(client.copy_in(&copy_sql).await.map_err(|e| {
-                            DumperError::Restore(format!(
-                                "COPY IN initialization failed for {}.{}: {}",
-                                d.schema_name, d.table_name, e
-                            ))
-                        })?);
-                        active_copy_sink =
-                            Some((d.schema_name.clone(), d.table_name.clone(), sink));
+                    if needs_new_sink {
+                        if let Some((old_s, old_t, mut old_sink)) = active_copy_sink.take() {
+                            old_sink.as_mut().finish().await.map_err(|e| {
+                                DumperError::Restore(format!(
+                                    "COPY IN finish failed for {}.{}: {}",
+                                    old_s, old_t, e
+                                ))
+                            })?;
+                        }
+                        if !d.is_last {
+                            let copy_sql = format!(
+                                "COPY {}.{} FROM STDIN (FORMAT binary)",
+                                quote_pg_identifier(&d.schema_name),
+                                quote_pg_identifier(&d.table_name)
+                            );
+                            let sink = Box::pin(client.copy_in(&copy_sql).await.map_err(|e| {
+                                DumperError::Restore(format!(
+                                    "COPY IN initialization failed for {}.{}: {}",
+                                    d.schema_name, d.table_name, e
+                                ))
+                            })?);
+                            active_copy_sink =
+                                Some((d.schema_name.clone(), d.table_name.clone(), sink));
+                        }
                     }
 
                     if let Some((_, _, ref mut sink)) = active_copy_sink {
@@ -801,9 +866,17 @@ impl DatabaseAdapter for PostgresAdapter {
                     }
                 }
                 StreamRecord::Sequence(seq) => {
+                    let regclass = format!(
+                        "{}.{}",
+                        quote_pg_identifier(&seq.schema_name),
+                        quote_pg_identifier(&seq.sequence_name)
+                    );
                     let seq_sql = format!(
-                        "CREATE SEQUENCE IF NOT EXISTS \"{}\".\"{}\"; SELECT setval('\"{}\".\"{}\"', {}, {});",
-                        seq.schema_name, seq.sequence_name, seq.schema_name, seq.sequence_name, seq.last_value, seq.is_called
+                        "CREATE SEQUENCE IF NOT EXISTS {}; SELECT setval({}, {}, {});",
+                        regclass,
+                        quote_pg_literal(&regclass),
+                        seq.last_value,
+                        seq.is_called
                     );
                     client.batch_execute(&seq_sql).await.map_err(|e| {
                         let msg = if let Some(d) = e.as_db_error() {
@@ -839,6 +912,13 @@ impl DatabaseAdapter for PostgresAdapter {
             }
         }
 
+        // Finalize any active sink that was left unclosed before stream end
+        if let Some((s, t, mut sink)) = active_copy_sink.take() {
+            sink.as_mut().finish().await.map_err(|e| {
+                DumperError::Restore(format!("COPY IN finish failed for {}.{}: {}", s, t, e))
+            })?;
+        }
+
         Ok(RestoreStats {
             tables_restored,
             records_processed,
@@ -857,14 +937,35 @@ fn extract_sequence_from_default(default_expr: &str, default_schema: &str) -> Op
         let s = parts[0].trim_matches('"');
         let q = parts[1].trim_matches('"');
         Some(format!(
-            "CREATE SEQUENCE IF NOT EXISTS \"{}\".\"{}\";",
-            s, q
+            "CREATE SEQUENCE IF NOT EXISTS {}.{};",
+            quote_pg_identifier(s),
+            quote_pg_identifier(q)
         ))
     } else {
         let q = seq_ref.trim_matches('"');
         Some(format!(
-            "CREATE SEQUENCE IF NOT EXISTS \"{}\".\"{}\";",
-            default_schema, q
+            "CREATE SEQUENCE IF NOT EXISTS {}.{};",
+            quote_pg_identifier(default_schema),
+            quote_pg_identifier(q)
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quote_pg_identifier() {
+        assert_eq!(quote_pg_identifier("users"), "\"users\"");
+        assert_eq!(quote_pg_identifier("user\"name"), "\"user\"\"name\"");
+        assert_eq!(quote_pg_identifier("public.users"), "\"public.users\"");
+    }
+
+    #[test]
+    fn test_quote_pg_literal() {
+        assert_eq!(quote_pg_literal("hello"), "'hello'");
+        assert_eq!(quote_pg_literal("O'Reilly"), "'O''Reilly'");
+        assert_eq!(quote_pg_literal(""), "''");
     }
 }
