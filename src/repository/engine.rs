@@ -146,6 +146,12 @@ impl<B: StorageBackend> RepositoryEngine<B> {
     /// Commit a snapshot atomically
     pub async fn commit_snapshot(&self, snapshot: &SnapshotMetadata) -> Result<(), DumperError> {
         let path = SnapshotMetadata::snapshot_path(&snapshot.id);
+        if self.backend.object_exists(&path).await? {
+            return Err(DumperError::Repository(format!(
+                "Snapshot ID collision detected: snapshot '{}' already exists",
+                snapshot.id
+            )));
+        }
         let data = serde_json::to_vec_pretty(snapshot)?;
         self.backend.put_object(&path, &data).await
     }
@@ -331,6 +337,9 @@ mod tests {
             blobs: vec![ref1],
         };
         engine.commit_snapshot(&snapshot).await.unwrap();
+
+        // Duplicate snapshot ID must be rejected to prevent overwrites
+        assert!(engine.commit_snapshot(&snapshot).await.is_err());
 
         // 6. List snapshots
         let list = engine.list_snapshots().await.unwrap();

@@ -482,6 +482,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "libc",
  "mysql_async",
  "rand 0.8.8",
  "reqwest",

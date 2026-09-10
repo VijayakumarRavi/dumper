@@ -60,6 +60,22 @@ impl LocalBackend {
     }
 }
 
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    unsafe {
+        if libc::kill(pid as libc::pid_t, 0) == 0 {
+            true
+        } else {
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn is_pid_alive(_pid: u32) -> bool {
+    false
+}
+
 impl StorageBackend for LocalBackend {
     async fn put_object(&self, path: &str, data: &[u8]) -> Result<(), DumperError> {
         let target_path = self.resolve_path(path)?;
@@ -252,9 +268,32 @@ impl StorageBackend for LocalBackend {
                     dirs.push(path);
                 } else if file_type.is_file()
                     && entry.file_name().to_string_lossy().starts_with(".tmp_")
-                    && fs::remove_file(&path).await.is_ok()
                 {
-                    cleaned += 1;
+                    // Do not delete in-flight temporary files written by active processes
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    let mut in_flight = false;
+
+                    if let Ok(meta) = entry.metadata().await {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(elapsed) = modified.elapsed() {
+                                if elapsed.as_secs() < 3600 {
+                                    let parts: Vec<&str> =
+                                        fname.trim_start_matches(".tmp_").split('_').collect();
+                                    if let Some(pid_str) = parts.first() {
+                                        if let Ok(pid) = pid_str.parse::<u32>() {
+                                            if pid == std::process::id() || is_pid_alive(pid) {
+                                                in_flight = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !in_flight && fs::remove_file(&path).await.is_ok() {
+                        cleaned += 1;
+                    }
                 }
             }
         }
@@ -339,5 +378,29 @@ mod tests {
         assert_eq!(backend.count_temp_files().await.unwrap(), 2);
         assert_eq!(backend.cleanup_temp_files().await.unwrap(), 2);
         assert_eq!(backend.count_temp_files().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_temp_file_not_deleted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+
+        let sub_dir = temp_dir.path().join("blobs/ab");
+        fs::create_dir_all(&sub_dir).await.unwrap();
+
+        // In-flight temp file with current PID and recent timestamp
+        let in_flight = sub_dir.join(format!(".tmp_{}_99999", std::process::id()));
+        // Abandoned temp file with non-existent PID (e.g. 99999999)
+        let abandoned = sub_dir.join(".tmp_99999999_12345");
+
+        fs::write(&in_flight, b"in-flight data").await.unwrap();
+        fs::write(&abandoned, b"abandoned data").await.unwrap();
+
+        assert_eq!(backend.count_temp_files().await.unwrap(), 2);
+        // Only abandoned file should be cleaned up; in-flight file preserved!
+        let cleaned = backend.cleanup_temp_files().await.unwrap();
+        assert_eq!(cleaned, 1);
+        assert!(in_flight.exists());
+        assert!(!abandoned.exists());
     }
 }

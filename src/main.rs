@@ -14,7 +14,6 @@ use dumper::stream::decoder::StreamDecoder;
 use dumper::stream::encoder::StreamEncoder;
 use dumper::ui::progress::{format_bytes, format_duration, ProgressEvent, ProgressReporter};
 use sha2::Digest;
-use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -167,7 +166,7 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                 meta.engine, meta.database, meta.server_version
             ));
 
-            let snapshot_short_id = hex::encode(rand::random::<[u8; 4]>());
+            let snapshot_short_id = hex::encode(rand::random::<[u8; 8]>());
             let full_id = hex::encode(rand::random::<[u8; 16]>());
 
             // Piping streaming encoder -> chunker -> repository using bounded pipe

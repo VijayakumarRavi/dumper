@@ -14,6 +14,7 @@ description = "A tiny, production-grade database backup, restore, verification, 
 bytes = { version = "1.9", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
 tokio = { version = "1.43", default-features = false, features = ["rt", "macros", "time", "sync", "io-util", "net", "fs", "signal"] }
+libc = { version = "0.2", default-features = false }
 
 # CLI Parsing
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
