@@ -38,6 +38,7 @@ impl TestMysqlServer {
                 format!("--datadir={}", path),
                 format!("--port={}", port),
                 format!("--socket={}/mysql.sock", path),
+                format!("--pid-file={}/mariadbd.pid", path),
                 "--bind-address=127.0.0.1".into(),
             ])
             .spawn()

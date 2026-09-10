@@ -8,6 +8,8 @@ use tempfile::TempDir;
 
 static PG_PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
+static PG_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct TestPgServer {
     dir: TempDir,
     port: u16,
@@ -25,6 +27,11 @@ impl TestPgServer {
             .output()
             .ok()?;
         if !init_status.status.success() {
+            eprintln!(
+                "initdb failed: stdout={}, stderr={}",
+                String::from_utf8_lossy(&init_status.stdout),
+                String::from_utf8_lossy(&init_status.stderr)
+            );
             return None;
         }
 
@@ -36,38 +43,54 @@ impl TestPgServer {
                 "-l",
                 &log_file,
                 "-o",
-                &format!("-p {}", port),
+                &format!("-p {} -c listen_addresses='127.0.0.1'", port),
                 "-w",
                 "start",
             ])
             .output()
             .ok()?;
         if !start_status.status.success() {
+            let pg_log = std::fs::read_to_string(&log_file).unwrap_or_default();
+            eprintln!(
+                "pg_ctl start failed: stdout={}, stderr={}, log={}",
+                String::from_utf8_lossy(&start_status.stdout),
+                String::from_utf8_lossy(&start_status.stderr),
+                pg_log
+            );
             return None;
         }
 
         Some(Self { dir, port })
     }
 
-    fn start_with_ssl() -> Option<Self> {
-        let dir = TempDir::new().ok()?;
-        let path = dir.path().to_str()?;
+    fn start_with_ssl() -> Result<Self, String> {
+        let dir = TempDir::new().map_err(|e| format!("TempDir::new failed: {}", e))?;
+        let path = dir
+            .path()
+            .to_str()
+            .ok_or_else(|| "dir.path() to_str failed".to_string())?;
         let offset = PG_PORT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let port = 54300 + ((std::process::id() as u16 % 200) * 10) + offset;
 
         let init_status = Command::new("initdb")
             .args(["-D", path, "--no-sync", "-A", "trust", "-U", "postgres"])
             .output()
-            .ok()?;
+            .map_err(|e| format!("initdb execution error: {}", e))?;
         if !init_status.status.success() {
-            return None;
+            return Err(format!(
+                "initdb failed: stdout={}, stderr={}",
+                String::from_utf8_lossy(&init_status.stdout),
+                String::from_utf8_lossy(&init_status.stderr)
+            ));
         }
 
-        // Generate self-signed cert and key
+        // Generate self-signed cert and key using explicit RSA 2048
         let openssl_status = Command::new("openssl")
             .args([
                 "req",
                 "-new",
+                "-newkey",
+                "rsa:2048",
                 "-x509",
                 "-days",
                 "1",
@@ -80,18 +103,23 @@ impl TestPgServer {
                 "/CN=127.0.0.1",
             ])
             .output()
-            .ok()?;
+            .map_err(|e| format!("openssl execution error: {}", e))?;
         if !openssl_status.status.success() {
-            return None;
+            return Err(format!(
+                "openssl failed: stdout={}, stderr={}",
+                String::from_utf8_lossy(&openssl_status.stdout),
+                String::from_utf8_lossy(&openssl_status.stderr)
+            ));
         }
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
+            std::fs::set_permissions(
                 format!("{}/server.key", path),
                 std::fs::Permissions::from_mode(0o600),
-            );
+            )
+            .map_err(|e| format!("chmod 0600 on server.key failed: {}", e))?;
         }
 
         let ssl_conf = format!(
@@ -102,8 +130,10 @@ impl TestPgServer {
         let mut conf_file = std::fs::OpenOptions::new()
             .append(true)
             .open(format!("{}/postgresql.conf", path))
-            .ok()?;
-        conf_file.write_all(ssl_conf.as_bytes()).ok()?;
+            .map_err(|e| format!("failed to open postgresql.conf: {}", e))?;
+        conf_file
+            .write_all(ssl_conf.as_bytes())
+            .map_err(|e| format!("failed to append ssl configuration: {}", e))?;
 
         let log_file = format!("{}/pg.log", path);
         let start_status = Command::new("pg_ctl")
@@ -113,17 +143,24 @@ impl TestPgServer {
                 "-l",
                 &log_file,
                 "-o",
-                &format!("-p {}", port),
+                &format!("-p {} -c listen_addresses='127.0.0.1'", port),
                 "-w",
                 "start",
             ])
             .output()
-            .ok()?;
+            .map_err(|e| format!("pg_ctl execution error: {}", e))?;
         if !start_status.status.success() {
-            return None;
+            let pg_log = std::fs::read_to_string(&log_file)
+                .unwrap_or_else(|e| format!("<could not read pg.log: {}>", e));
+            return Err(format!(
+                "pg_ctl start failed: stdout={}, stderr={}, pg.log={}",
+                String::from_utf8_lossy(&start_status.stdout),
+                String::from_utf8_lossy(&start_status.stderr),
+                pg_log
+            ));
         }
 
-        Some(Self { dir, port })
+        Ok(Self { dir, port })
     }
 
     fn url(&self) -> String {
@@ -159,6 +196,7 @@ impl Drop for TestPgServer {
 
 #[tokio::test]
 async fn test_postgres_restore_propagates_postdata_error() {
+    let _test_guard = PG_TEST_MUTEX.lock().await;
     let pg = match TestPgServer::start() {
         Some(server) => server,
         None => {
@@ -242,6 +280,7 @@ async fn test_postgres_restore_propagates_postdata_error() {
 
 #[tokio::test]
 async fn test_postgres_custom_types_and_precision_preserved() {
+    let _test_guard = PG_TEST_MUTEX.lock().await;
     let pg = match TestPgServer::start() {
         Some(server) => server,
         None => {
@@ -367,6 +406,7 @@ async fn test_postgres_custom_types_and_precision_preserved() {
 
 #[tokio::test]
 async fn test_postgres_sequence_and_serial_restoration_roundtrip() {
+    let _test_guard = PG_TEST_MUTEX.lock().await;
     let pg = match TestPgServer::start() {
         Some(server) => server,
         None => {
@@ -471,6 +511,7 @@ async fn test_postgres_sequence_and_serial_restoration_roundtrip() {
 
 #[tokio::test]
 async fn test_postgres_restore_target_database_override() {
+    let _test_guard = PG_TEST_MUTEX.lock().await;
     let pg = match TestPgServer::start() {
         Some(server) => server,
         None => {
@@ -573,6 +614,7 @@ async fn test_postgres_restore_target_database_override() {
 
 #[tokio::test]
 async fn test_postgres_tls_rejection_on_sslmode_require() {
+    let _test_guard = PG_TEST_MUTEX.lock().await;
     let pg = match TestPgServer::start() {
         Some(server) => server,
         None => {
@@ -616,6 +658,7 @@ async fn test_postgres_tls_rejection_on_sslmode_require() {
 
 #[tokio::test]
 async fn test_postgres_tls_success_roundtrip() {
+    let _test_guard = PG_TEST_MUTEX.lock().await;
     let is_initdb_available = std::process::Command::new("initdb")
         .arg("--version")
         .output()
@@ -623,10 +666,13 @@ async fn test_postgres_tls_success_roundtrip() {
         .unwrap_or(false);
 
     let pg = match TestPgServer::start_with_ssl() {
-        Some(server) => server,
-        None => {
+        Ok(server) => server,
+        Err(err) => {
             if is_initdb_available {
-                panic!("initdb is available but TestPgServer::start_with_ssl() failed to start SSL-enabled cluster");
+                panic!(
+                    "initdb is available but TestPgServer::start_with_ssl() failed: {}",
+                    err
+                );
             } else {
                 eprintln!("PostgreSQL not installed, skipping test.");
                 return;
@@ -778,6 +824,7 @@ async fn test_postgres_tls_success_roundtrip() {
 
 #[tokio::test]
 async fn test_postgres_concurrent_write_consistency() {
+    let _test_guard = PG_TEST_MUTEX.lock().await;
     let pg = match TestPgServer::start() {
         Some(server) => server,
         None => return,

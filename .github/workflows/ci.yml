@@ -78,7 +78,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql mariadb-server curl
+          sudo apt-get install -y -qq postgresql mariadb-server curl openssl
           # Download MinIO binary for local service test discovery
           curl -sSL -o /tmp/minio https://dl.min.io/server/minio/release/linux-amd64/minio
           chmod +x /tmp/minio
