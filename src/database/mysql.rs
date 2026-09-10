@@ -37,6 +37,11 @@ pub fn escape_mysql_string(s: &str) -> String {
     escaped
 }
 
+/// Quotes an identifier (table name, column name, etc.) using backticks with internal backticks escaped.
+pub fn quote_mysql_identifier(id: &str) -> String {
+    format!("`{}`", id.replace('`', "``"))
+}
+
 pub struct MysqlAdapter {
     url: String,
 }
@@ -129,7 +134,7 @@ impl DatabaseAdapter for MysqlAdapter {
 
         for (db, table) in &meta.table_names {
             // Get CREATE TABLE statement
-            let show_create_query = format!("SHOW CREATE TABLE `{}`", table);
+            let show_create_query = format!("SHOW CREATE TABLE {}", quote_mysql_identifier(table));
             let show_row: Option<(String, String)> = conn
                 .query_first(&show_create_query)
                 .await
@@ -139,7 +144,10 @@ impl DatabaseAdapter for MysqlAdapter {
                 .map(|(_, sql)| format!("{};", sql))
                 .unwrap_or_default();
 
-            let cols_query = format!("SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = '{}' AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position", table);
+            let cols_query = format!(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = {} AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position",
+                escape_mysql_string(table)
+            );
             let col_names: Vec<String> = conn
                 .query_map(&cols_query, |c: String| c)
                 .await
@@ -165,14 +173,14 @@ impl DatabaseAdapter for MysqlAdapter {
 
             // Stream rows as chunked JSON/TSV data
             let select_query = if col_names.is_empty() {
-                format!("SELECT * FROM `{}`", table)
+                format!("SELECT * FROM {}", quote_mysql_identifier(table))
             } else {
                 let quoted_cols = col_names
                     .iter()
-                    .map(|c| format!("`{}`", c))
+                    .map(|c| quote_mysql_identifier(c))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("SELECT {} FROM `{}`", quoted_cols, table)
+                format!("SELECT {} FROM {}", quoted_cols, quote_mysql_identifier(table))
             };
 
             let mut result_stream = conn
@@ -281,7 +289,11 @@ impl DatabaseAdapter for MysqlAdapter {
             .unwrap_or_default();
 
         for (vname, vdef) in views {
-            let sql = format!("CREATE OR REPLACE VIEW `{}` AS {};", vname, vdef);
+            let sql = format!(
+                "CREATE OR REPLACE VIEW {} AS {};",
+                quote_mysql_identifier(&vname),
+                vdef
+            );
             encoder
                 .write_record(&StreamRecord::Routine(RoutineRecord {
                     schema_name: meta.database.clone(),
@@ -293,28 +305,33 @@ impl DatabaseAdapter for MysqlAdapter {
         }
 
         // 4. Triggers
-        let triggers: Vec<String> = conn
+        let triggers: Vec<(String, String)> = conn
             .query_map("SHOW TRIGGERS", |mut row: mysql_async::Row| {
                 let stmt: String = row.take("Statement").unwrap();
                 let trigger: String = row.take("Trigger").unwrap();
                 let timing: String = row.take("Timing").unwrap();
                 let event: String = row.take("Event").unwrap();
                 let table: String = row.take("Table").unwrap();
-                format!(
-                    "CREATE TRIGGER `{}` {} {} ON `{}` FOR EACH ROW {}",
-                    trigger, timing, event, table, stmt
-                )
+                let sql = format!(
+                    "CREATE TRIGGER {} {} {} ON {} FOR EACH ROW {}",
+                    quote_mysql_identifier(&trigger),
+                    timing,
+                    event,
+                    quote_mysql_identifier(&table),
+                    stmt
+                );
+                (trigger, sql)
             })
             .await
             .unwrap_or_default();
 
-        for trig in triggers {
+        for (trig_name, trig_sql) in triggers {
             encoder
                 .write_record(&StreamRecord::PostData(PostDataRecord {
                     schema_name: meta.database.clone(),
                     table_name: "".into(),
-                    name: "".into(),
-                    sql: format!("{};", trig),
+                    name: trig_name,
+                    sql: format!("{};", trig_sql),
                 }))
                 .await?;
         }
@@ -329,7 +346,7 @@ impl DatabaseAdapter for MysqlAdapter {
             .unwrap_or_default();
 
         for p in procs {
-            let q = format!("SHOW CREATE PROCEDURE `{}`", p);
+            let q = format!("SHOW CREATE PROCEDURE {}", quote_mysql_identifier(&p));
             if let Ok(Some(mut row)) = conn.query_first::<mysql_async::Row, _>(&q).await {
                 if let Some(def) = row.take("Create Procedure") {
                     let def: String = def;
@@ -354,7 +371,7 @@ impl DatabaseAdapter for MysqlAdapter {
             .unwrap_or_default();
 
         for f in funcs {
-            let q = format!("SHOW CREATE FUNCTION `{}`", f);
+            let q = format!("SHOW CREATE FUNCTION {}", quote_mysql_identifier(&f));
             if let Ok(Some(mut row)) = conn.query_first::<mysql_async::Row, _>(&q).await {
                 if let Some(def) = row.take("Create Function") {
                     let def: String = def;
@@ -412,7 +429,8 @@ impl DatabaseAdapter for MysqlAdapter {
                 }
                 StreamRecord::TableSchema(s) => {
                     if options.drop_existing {
-                        let drop_sql = format!("DROP TABLE IF EXISTS `{}`;", s.table_name);
+                        let drop_sql =
+                            format!("DROP TABLE IF EXISTS {};", quote_mysql_identifier(&s.table_name));
                         let _ = conn.query_drop(&drop_sql).await;
                     }
                     conn.query_drop(&s.create_sql).await.map_err(|e| {
@@ -427,7 +445,7 @@ impl DatabaseAdapter for MysqlAdapter {
                         let col_names = s
                             .columns
                             .iter()
-                            .map(|c| format!("`{}`", c.name))
+                            .map(|c| quote_mysql_identifier(&c.name))
                             .collect::<Vec<_>>()
                             .join(", ");
                         table_columns_cache.insert(s.table_name.clone(), col_names);
@@ -443,11 +461,11 @@ impl DatabaseAdapter for MysqlAdapter {
                             Some(cols) => cols.clone(),
                             None => {
                                 let cols_query = format!(
-                                    "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = '{}' AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position",
-                                    d.table_name
+                                    "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = {} AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position",
+                                    escape_mysql_string(&d.table_name)
                                 );
                                 let cols: Vec<String> = conn
-                                    .query_map(&cols_query, |c: String| format!("`{}`", c))
+                                    .query_map(&cols_query, |c: String| quote_mysql_identifier(&c))
                                     .await
                                     .unwrap_or_default();
                                 let cols_str = cols.join(", ");
@@ -457,9 +475,13 @@ impl DatabaseAdapter for MysqlAdapter {
                         };
 
                         let insert_prefix = if col_names.is_empty() {
-                            format!("INSERT INTO `{}` VALUES", d.table_name)
+                            format!("INSERT INTO {} VALUES", quote_mysql_identifier(&d.table_name))
                         } else {
-                            format!("INSERT INTO `{}` ({}) VALUES", d.table_name, col_names)
+                            format!(
+                                "INSERT INTO {} ({}) VALUES",
+                                quote_mysql_identifier(&d.table_name),
+                                col_names
+                            )
                         };
 
                         // Wrap batch slice in a transaction for atomicity and high insert throughput
@@ -503,11 +525,33 @@ impl DatabaseAdapter for MysqlAdapter {
                     }
                 }
                 StreamRecord::PostData(p) => {
+                    if options.drop_existing && !p.name.is_empty() {
+                        let drop_sql = format!(
+                            "DROP TRIGGER IF EXISTS {};",
+                            quote_mysql_identifier(&p.name)
+                        );
+                        let _ = conn.query_drop(&drop_sql).await;
+                    }
                     conn.query_drop(&p.sql).await.map_err(|e| {
                         DumperError::Restore(format!("Failed to execute post-data in MySQL: {}", e))
                     })?;
                 }
                 StreamRecord::Routine(r) => {
+                    if options.drop_existing {
+                        let drop_sql = match r.routine_type.as_str() {
+                            "PROCEDURE" => {
+                                format!("DROP PROCEDURE IF EXISTS {};", quote_mysql_identifier(&r.name))
+                            }
+                            "FUNCTION" => {
+                                format!("DROP FUNCTION IF EXISTS {};", quote_mysql_identifier(&r.name))
+                            }
+                            "VIEW" => format!("DROP VIEW IF EXISTS {};", quote_mysql_identifier(&r.name)),
+                            _ => String::new(),
+                        };
+                        if !drop_sql.is_empty() {
+                            let _ = conn.query_drop(&drop_sql).await;
+                        }
+                    }
                     conn.query_drop(&r.sql).await.map_err(|e| {
                         DumperError::Restore(format!(
                             "Failed to create routine/view '{}' in MySQL: {}",
@@ -552,5 +596,12 @@ mod tests {
         assert_eq!(escape_mysql_string("null\0byte"), "'null\\0byte'");
         assert_eq!(escape_mysql_string("ctrl\x1Az"), "'ctrl\\Zz'");
         assert_eq!(escape_mysql_string("back\x08space"), "'back\\bspace'");
+    }
+
+    #[test]
+    fn test_quote_mysql_identifier() {
+        assert_eq!(quote_mysql_identifier("users"), "`users`");
+        assert_eq!(quote_mysql_identifier("user`name"), "`user``name`");
+        assert_eq!(quote_mysql_identifier("a`b`c"), "`a``b``c`");
     }
 }
