@@ -1,6 +1,6 @@
 [package]
 name = "dumper"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Dumper Maintainers"]
 categories = ["command-line-utilities", "database"]
 edition = "2021"
