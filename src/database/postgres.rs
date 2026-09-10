@@ -481,16 +481,18 @@ impl DatabaseAdapter for PostgresAdapter {
             while let Some(chunk_res) = copy_out.next().await {
                 let chunk = chunk_res
                     .map_err(|e| DumperError::Database(format!("COPY read error: {}", e)))?;
-                slice_seq += 1;
-                encoder
-                    .write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
-                        schema_name: schema.clone(),
-                        table_name: table.clone(),
-                        slice_seq,
-                        is_last: false,
-                        data: chunk.to_vec(),
-                    }))
-                    .await?;
+                for sub_chunk in chunk.chunks(1024 * 1024) {
+                    slice_seq += 1;
+                    encoder
+                        .write_record(&StreamRecord::TableDataSlice(TableDataSliceRecord {
+                            schema_name: schema.clone(),
+                            table_name: table.clone(),
+                            slice_seq,
+                            is_last: false,
+                            data: sub_chunk.to_vec(),
+                        }))
+                        .await?;
+                }
             }
 
             // Signal end of table slice

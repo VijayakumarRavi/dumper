@@ -39,6 +39,14 @@ impl<W: AsyncWrite + Unpin + Send> StreamEncoder<W> {
         flags: u8,
         payload: &[u8],
     ) -> Result<(), DumperError> {
+        if payload.len() > MAX_PAYLOAD_SIZE {
+            return Err(DumperError::Format(format!(
+                "Payload size {} exceeds maximum allowed frame limit {}",
+                payload.len(),
+                MAX_PAYLOAD_SIZE
+            )));
+        }
+
         self.ensure_magic().await?;
 
         let mut crc_hasher = CrcHasher::new();

@@ -77,7 +77,6 @@ impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
         let payload_len = u32::from_le_bytes(len_bytes) as usize;
 
         // Bounded payload limit to prevent malicious memory allocation
-        const MAX_PAYLOAD_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
         if payload_len > MAX_PAYLOAD_SIZE {
             return Err(DumperError::Integrity(format!(
                 "Payload size {} exceeds maximum allowed frame limit",
@@ -298,5 +297,37 @@ mod tests {
 
         let r5 = decoder.read_next_record().await.unwrap();
         assert!(r5.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_large_payload_exceeding_8mb() {
+        let mut buffer = Vec::new();
+        // 3 MiB of raw data serializes as JSON array to ~9-10 MiB, exceeding old 8 MiB limit
+        let large_data = TableDataSliceRecord {
+            schema_name: "public".into(),
+            table_name: "blobs".into(),
+            slice_seq: 1,
+            is_last: true,
+            data: vec![0x42u8; 3 * 1024 * 1024],
+        };
+
+        {
+            let mut encoder = StreamEncoder::new(&mut buffer);
+            encoder
+                .write_record(&StreamRecord::TableDataSlice(large_data))
+                .await
+                .unwrap();
+            encoder.finish().await.unwrap();
+        }
+
+        let mut decoder = StreamDecoder::new(&buffer[..]);
+        let r1 = decoder.read_next_record().await.unwrap().unwrap();
+        match r1 {
+            StreamRecord::TableDataSlice(d) => {
+                assert_eq!(d.data.len(), 3 * 1024 * 1024);
+                assert_eq!(d.data[0], 0x42);
+            }
+            _ => panic!("Expected TableDataSlice"),
+        }
     }
 }

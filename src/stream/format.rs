@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const STREAM_MAGIC: &[u8; 4] = b"DMP1";
 pub const STREAM_VERSION: u16 = 1;
+pub const MAX_PAYLOAD_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
