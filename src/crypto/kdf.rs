@@ -13,7 +13,10 @@ pub fn generate_salt() -> [u8; SALT_LEN] {
 
 /// Derive a 256-bit encryption key from a password and salt using Argon2id.
 /// Designed to run comfortably within 32MB RAM containers.
-pub fn derive_key(password: &str, salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; KEY_LEN]>, DumperError> {
+pub fn derive_key(
+    password: &str,
+    salt: &[u8],
+) -> Result<zeroize::Zeroizing<[u8; KEY_LEN]>, DumperError> {
     if password.is_empty() {
         return Err(DumperError::Authentication(
             "Password cannot be empty".into(),

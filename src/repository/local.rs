@@ -357,9 +357,18 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
 
-        backend.put_object("blobs/test", b"version 1").await.unwrap();
-        backend.put_object("blobs/test", b"version 2").await.unwrap();
-        assert_eq!(backend.get_object("blobs/test").await.unwrap(), b"version 2");
+        backend
+            .put_object("blobs/test", b"version 1")
+            .await
+            .unwrap();
+        backend
+            .put_object("blobs/test", b"version 2")
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.get_object("blobs/test").await.unwrap(),
+            b"version 2"
+        );
     }
 
     #[tokio::test]

@@ -328,7 +328,10 @@ impl DatabaseAdapter for PostgresAdapter {
                 encoder
                     .write_record(&StreamRecord::PreData(PreDataRecord {
                         name: schema.clone(),
-                        sql: format!("CREATE SCHEMA IF NOT EXISTS {};", quote_pg_identifier(&schema)),
+                        sql: format!(
+                            "CREATE SCHEMA IF NOT EXISTS {};",
+                            quote_pg_identifier(&schema)
+                        ),
                     }))
                     .await?;
             }

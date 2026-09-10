@@ -72,10 +72,8 @@ impl<'a> SigV4Signer<'a> {
         let safe_uri = if trimmed_uri.is_empty() {
             "/".to_string()
         } else {
-            let encoded_segments: Vec<String> = trimmed_uri
-                .split('/')
-                .map(urlencoding::encode)
-                .collect();
+            let encoded_segments: Vec<String> =
+                trimmed_uri.split('/').map(urlencoding::encode).collect();
             format!("/{}", encoded_segments.join("/"))
         };
 

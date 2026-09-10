@@ -180,7 +180,11 @@ impl DatabaseAdapter for MysqlAdapter {
                     .map(|c| quote_mysql_identifier(c))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("SELECT {} FROM {}", quoted_cols, quote_mysql_identifier(table))
+                format!(
+                    "SELECT {} FROM {}",
+                    quoted_cols,
+                    quote_mysql_identifier(table)
+                )
             };
 
             let mut result_stream = conn
@@ -429,8 +433,10 @@ impl DatabaseAdapter for MysqlAdapter {
                 }
                 StreamRecord::TableSchema(s) => {
                     if options.drop_existing {
-                        let drop_sql =
-                            format!("DROP TABLE IF EXISTS {};", quote_mysql_identifier(&s.table_name));
+                        let drop_sql = format!(
+                            "DROP TABLE IF EXISTS {};",
+                            quote_mysql_identifier(&s.table_name)
+                        );
                         let _ = conn.query_drop(&drop_sql).await;
                     }
                     conn.query_drop(&s.create_sql).await.map_err(|e| {
@@ -475,7 +481,10 @@ impl DatabaseAdapter for MysqlAdapter {
                         };
 
                         let insert_prefix = if col_names.is_empty() {
-                            format!("INSERT INTO {} VALUES", quote_mysql_identifier(&d.table_name))
+                            format!(
+                                "INSERT INTO {} VALUES",
+                                quote_mysql_identifier(&d.table_name)
+                            )
                         } else {
                             format!(
                                 "INSERT INTO {} ({}) VALUES",
@@ -540,12 +549,20 @@ impl DatabaseAdapter for MysqlAdapter {
                     if options.drop_existing {
                         let drop_sql = match r.routine_type.as_str() {
                             "PROCEDURE" => {
-                                format!("DROP PROCEDURE IF EXISTS {};", quote_mysql_identifier(&r.name))
+                                format!(
+                                    "DROP PROCEDURE IF EXISTS {};",
+                                    quote_mysql_identifier(&r.name)
+                                )
                             }
                             "FUNCTION" => {
-                                format!("DROP FUNCTION IF EXISTS {};", quote_mysql_identifier(&r.name))
+                                format!(
+                                    "DROP FUNCTION IF EXISTS {};",
+                                    quote_mysql_identifier(&r.name)
+                                )
                             }
-                            "VIEW" => format!("DROP VIEW IF EXISTS {};", quote_mysql_identifier(&r.name)),
+                            "VIEW" => {
+                                format!("DROP VIEW IF EXISTS {};", quote_mysql_identifier(&r.name))
+                            }
                             _ => String::new(),
                         };
                         if !drop_sql.is_empty() {
