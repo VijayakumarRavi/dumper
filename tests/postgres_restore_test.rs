@@ -35,6 +35,15 @@ impl TestPgServer {
             return None;
         }
 
+        use std::io::Write;
+        if let Ok(mut conf_file) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(format!("{}/postgresql.conf", path))
+        {
+            let _ = writeln!(conf_file, "\nunix_socket_directories = '{}'", path);
+            let _ = writeln!(conf_file, "listen_addresses = '127.0.0.1'");
+        }
+
         let log_file = format!("{}/pg.log", path);
         let start_status = Command::new("pg_ctl")
             .args([
@@ -43,7 +52,7 @@ impl TestPgServer {
                 "-l",
                 &log_file,
                 "-o",
-                &format!("-p {} -c listen_addresses='127.0.0.1'", port),
+                &format!("-p {} -k '{}' -c listen_addresses='127.0.0.1'", port, path),
                 "-w",
                 "start",
             ])
@@ -123,8 +132,8 @@ impl TestPgServer {
         }
 
         let ssl_conf = format!(
-            "\nssl = on\nssl_cert_file = '{}/server.crt'\nssl_key_file = '{}/server.key'\n",
-            path, path
+            "\nunix_socket_directories = '{}'\nlisten_addresses = '127.0.0.1'\nssl = on\nssl_cert_file = '{}/server.crt'\nssl_key_file = '{}/server.key'\n",
+            path, path, path
         );
         use std::io::Write;
         let mut conf_file = std::fs::OpenOptions::new()
@@ -143,7 +152,7 @@ impl TestPgServer {
                 "-l",
                 &log_file,
                 "-o",
-                &format!("-p {} -c listen_addresses='127.0.0.1'", port),
+                &format!("-p {} -k '{}' -c listen_addresses='127.0.0.1'", port, path),
                 "-w",
                 "start",
             ])
@@ -615,9 +624,18 @@ async fn test_postgres_restore_target_database_override() {
 #[tokio::test]
 async fn test_postgres_tls_rejection_on_sslmode_require() {
     let _test_guard = PG_TEST_MUTEX.lock().await;
+    let is_initdb_available = std::process::Command::new("initdb")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
     let pg = match TestPgServer::start() {
         Some(server) => server,
         None => {
+            if is_initdb_available {
+                panic!("initdb is available but TestPgServer::start() failed");
+            }
             eprintln!("PostgreSQL not available or failed to start, skipping test.");
             return;
         }
