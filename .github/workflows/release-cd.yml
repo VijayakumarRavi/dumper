@@ -81,6 +81,7 @@ jobs:
 
       - name: Package release artifact (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           $TAG = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v0.1.0" }
           $ARCHIVE = "${{ env.BINARY_NAME }}-${TAG}-${{ matrix.job.target }}.zip"

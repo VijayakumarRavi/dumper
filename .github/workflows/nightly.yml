@@ -66,6 +66,7 @@ jobs:
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           $DATE = Get-Date -Format "yyyyMMdd"
           $ARCHIVE = "${{ env.BINARY_NAME }}-nightly-${DATE}-${{ matrix.job.target }}.zip"

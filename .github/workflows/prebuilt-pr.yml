@@ -64,6 +64,7 @@ jobs:
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           $PR_NUM = if ($env:GITHUB_EVENT_PULL_REQUEST_NUMBER) { $env:GITHUB_EVENT_PULL_REQUEST_NUMBER } else { "manual" }
           $ARCHIVE = "${{ env.BINARY_NAME }}-pr${PR_NUM}-${{ matrix.job.target }}.zip"
