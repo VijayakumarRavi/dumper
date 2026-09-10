@@ -379,8 +379,8 @@ mod tests {
         let sub_dir = temp_dir.path().join("blobs/ab");
         fs::create_dir_all(&sub_dir).await.unwrap();
 
-        let tmp1 = sub_dir.join(".tmp_111");
-        let tmp2 = temp_dir.path().join(".tmp_222");
+        let tmp1 = sub_dir.join(".tmp_99999998_111");
+        let tmp2 = temp_dir.path().join(".tmp_99999999_222");
         fs::write(&tmp1, b"partial").await.unwrap();
         fs::write(&tmp2, b"partial").await.unwrap();
 

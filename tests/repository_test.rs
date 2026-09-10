@@ -353,8 +353,8 @@ async fn test_abandoned_temp_files_cleanup_and_detection() {
     tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
     tokio::fs::create_dir_all(&snaps_dir).await.unwrap();
 
-    let fake_tmp1 = blobs_dir.join(".tmp_1111_2222");
-    let fake_tmp2 = snaps_dir.join(".tmp_3333_4444");
+    let fake_tmp1 = blobs_dir.join(".tmp_99999998_2222");
+    let fake_tmp2 = snaps_dir.join(".tmp_99999999_4444");
     tokio::fs::write(&fake_tmp1, b"abandoned partial blob data")
         .await
         .unwrap();
