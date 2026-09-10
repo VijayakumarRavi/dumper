@@ -17,6 +17,7 @@ tokio = { version = "1.43", default-features = false, features = ["rt", "macros"
 
 # CLI Parsing
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+rpassword = { version = "7.3", default-features = false }
 
 # Cryptography
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }

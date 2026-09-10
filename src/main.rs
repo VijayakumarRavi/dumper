@@ -604,21 +604,18 @@ fn resolve_password(cli: &Cli, is_init: bool) -> Result<String, DumperError> {
         return Ok(content.trim().to_string());
     }
 
-    // Interactive prompt
+    // Interactive prompt without terminal echo
     let prompt = if is_init {
         "Enter new repository password: "
     } else {
         "Enter repository password: "
     };
 
-    eprint!("{}", prompt);
-    let mut input = String::new();
-    let stdin = io::stdin();
-    stdin.lock().read_line(&mut input).map_err(|e| {
+    let pass = rpassword::prompt_password(prompt).map_err(|e| {
         DumperError::Authentication(format!("Failed to read password from stdin: {}", e))
     })?;
 
-    let trimmed = input.trim().to_string();
+    let trimmed = pass.trim().to_string();
     if trimmed.is_empty() {
         return Err(DumperError::Authentication(
             "Password cannot be empty".into(),
