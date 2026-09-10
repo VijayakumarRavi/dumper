@@ -15,7 +15,7 @@ pub struct RepositoryConfig {
 }
 
 impl RepositoryConfig {
-    pub fn new(password: &str) -> Result<(Self, [u8; 32]), DumperError> {
+    pub fn new(password: &str) -> Result<(Self, zeroize::Zeroizing<[u8; 32]>), DumperError> {
         let (envelope, master_key) = KeyEnvelope::create(password)?;
         let repository_id = hex::encode(rand::random::<[u8; 16]>());
 
@@ -29,7 +29,7 @@ impl RepositoryConfig {
         Ok((config, master_key))
     }
 
-    pub fn unlock(&self, password: &str) -> Result<[u8; 32], DumperError> {
+    pub fn unlock(&self, password: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, DumperError> {
         if self.format_version > REPO_FORMAT_VERSION {
             return Err(DumperError::Format(format!(
                 "Repository format version {} is newer than supported version {}",

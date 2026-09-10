@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 pub struct RepositoryEngine<B: StorageBackend> {
     backend: Arc<B>,
-    master_key: [u8; 32],
+    master_key: zeroize::Zeroizing<[u8; 32]>,
     pub config: RepositoryConfig,
 }
 
@@ -19,7 +19,7 @@ impl<B: StorageBackend> Clone for RepositoryEngine<B> {
     fn clone(&self) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
-            master_key: self.master_key,
+            master_key: self.master_key.clone(),
             config: self.config.clone(),
         }
     }
