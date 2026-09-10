@@ -94,7 +94,6 @@ impl From<serde_json::Error> for DumperError {
 /// Sanitizes potential passwords or access keys in database URLs or text.
 pub fn sanitize_secrets(input: &str) -> String {
     // Check if input contains a database URL with a password pattern: scheme://user:password@host
-    let mut result = input.to_string();
     if let Ok(mut url) = url::Url::parse(input) {
         if url.password().is_some() {
             let _ = url.set_password(Some("*****"));
@@ -102,7 +101,7 @@ pub fn sanitize_secrets(input: &str) -> String {
         }
     }
 
-    // Heuristic regex-like substitution for passwords in connection strings or keys
+    let mut result = input.to_string();
     let schemes = [
         "postgres://",
         "postgresql://",
@@ -111,22 +110,36 @@ pub fn sanitize_secrets(input: &str) -> String {
         "http://",
         "https://",
     ];
+
     for scheme in &schemes {
-        if let Some(pos) = result.find(scheme) {
-            let rest = &result[pos + scheme.len()..];
-            if let Some(at_pos) = rest.find('@') {
-                let user_info = &rest[..at_pos];
+        let mut search_from = 0;
+        while let Some(rel_pos) = result[search_from..].find(scheme) {
+            let pos = search_from + rel_pos;
+            let after_scheme = pos + scheme.len();
+            let rest = &result[after_scheme..];
+
+            // Look for '@' before any whitespace, quotes, or another scheme
+            let end_candidate = rest
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '`')
+                .unwrap_or(rest.len());
+            let candidate = &rest[..end_candidate];
+
+            if let Some(at_pos) = candidate.find('@') {
+                let user_info = &candidate[..at_pos];
                 if let Some(colon_pos) = user_info.find(':') {
                     let sanitized = format!(
                         "{}{}{}:*****{}",
                         &result[..pos],
                         scheme,
                         &user_info[..colon_pos],
-                        &rest[at_pos..]
+                        &result[after_scheme + at_pos..]
                     );
+                    search_from = pos + scheme.len() + colon_pos + 6; // advance past ":*****@"
                     result = sanitized;
+                    continue;
                 }
             }
+            search_from = after_scheme;
         }
     }
 
@@ -148,6 +161,16 @@ mod tests {
         let sanitized_mysql = sanitize_secrets(raw_mysql);
         assert!(!sanitized_mysql.contains("pass"));
         assert!(sanitized_mysql.contains("user:*****@127.0.0.1"));
+    }
+
+    #[test]
+    fn test_sanitize_multiple_database_urls() {
+        let raw = "Replication failed between postgres://admin:secret1@host1:5432/db and postgres://backup:secret2@host2:5432/db";
+        let sanitized = sanitize_secrets(raw);
+        assert!(!sanitized.contains("secret1"));
+        assert!(!sanitized.contains("secret2"));
+        assert!(sanitized.contains("admin:*****@host1"));
+        assert!(sanitized.contains("backup:*****@host2"));
     }
 
     #[test]

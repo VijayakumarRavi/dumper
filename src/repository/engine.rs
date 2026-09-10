@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 pub struct RepositoryEngine<B: StorageBackend> {
     backend: Arc<B>,
-    master_key: [u8; 32],
+    master_key: zeroize::Zeroizing<[u8; 32]>,
     pub config: RepositoryConfig,
 }
 
@@ -19,7 +19,7 @@ impl<B: StorageBackend> Clone for RepositoryEngine<B> {
     fn clone(&self) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
-            master_key: self.master_key,
+            master_key: self.master_key.clone(),
             config: self.config.clone(),
         }
     }
@@ -146,6 +146,12 @@ impl<B: StorageBackend> RepositoryEngine<B> {
     /// Commit a snapshot atomically
     pub async fn commit_snapshot(&self, snapshot: &SnapshotMetadata) -> Result<(), DumperError> {
         let path = SnapshotMetadata::snapshot_path(&snapshot.id);
+        if self.backend.object_exists(&path).await? {
+            return Err(DumperError::Repository(format!(
+                "Snapshot ID collision detected: snapshot '{}' already exists",
+                snapshot.id
+            )));
+        }
         let data = serde_json::to_vec_pretty(snapshot)?;
         self.backend.put_object(&path, &data).await
     }
@@ -331,6 +337,9 @@ mod tests {
             blobs: vec![ref1],
         };
         engine.commit_snapshot(&snapshot).await.unwrap();
+
+        // Duplicate snapshot ID must be rejected to prevent overwrites
+        assert!(engine.commit_snapshot(&snapshot).await.is_err());
 
         // 6. List snapshots
         let list = engine.list_snapshots().await.unwrap();

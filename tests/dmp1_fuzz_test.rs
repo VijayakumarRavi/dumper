@@ -32,8 +32,8 @@ async fn test_fuzz_oversized_payload() {
     data.push(0x01); // Header
     data.push(0x00);
 
-    // Payload length: 10 MiB (exceeds 8 MiB limit)
-    let len: u32 = 10 * 1024 * 1024;
+    // Payload length: 33 MiB (exceeds 32 MiB limit)
+    let len: u32 = 33 * 1024 * 1024;
     data.extend_from_slice(&len.to_le_bytes());
 
     // Some random payload

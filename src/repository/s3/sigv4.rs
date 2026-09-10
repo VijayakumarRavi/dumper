@@ -67,11 +67,15 @@ impl<'a> SigV4Signer<'a> {
         }
         let signed_headers = signed_headers_vec.join(";");
 
-        // Canonical request
-        let mut safe_uri = canonical_uri.to_string();
-        if !safe_uri.starts_with('/') {
-            safe_uri = format!("/{}", safe_uri);
-        }
+        // Canonical URI according to RFC 3986 (URI-encode each path segment)
+        let trimmed_uri = canonical_uri.trim_start_matches('/');
+        let safe_uri = if trimmed_uri.is_empty() {
+            "/".to_string()
+        } else {
+            let encoded_segments: Vec<String> =
+                trimmed_uri.split('/').map(urlencoding::encode).collect();
+            format!("/{}", encoded_segments.join("/"))
+        };
 
         let canonical_request = format!(
             "{}\n{}\n{}\n{}\n{}\n{}",
@@ -161,6 +165,31 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert!(auth.starts_with(
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"
+        ));
+    }
+
+    #[test]
+    fn test_sigv4_path_segment_encoding() {
+        let signer = SigV4Signer::new(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+        );
+        let now = DateTime::from_timestamp(1369353600, 0).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert("host".into(), "examplebucket.s3.amazonaws.com".into());
+
+        let (_amz_date, _hash, auth_special) = signer.sign(
+            "GET",
+            "/mybucket/special key with spaces/file+test.txt",
+            &BTreeMap::new(),
+            &headers,
+            b"",
+            now,
+        );
+
+        assert!(auth_special.starts_with(
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"
         ));
     }

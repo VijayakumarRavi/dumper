@@ -14,7 +14,6 @@ use dumper::stream::decoder::StreamDecoder;
 use dumper::stream::encoder::StreamEncoder;
 use dumper::ui::progress::{format_bytes, format_duration, ProgressEvent, ProgressReporter};
 use sha2::Digest;
-use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -48,6 +47,7 @@ async fn main() {
 
     if let Err(err) = run(cli, &reporter).await {
         let code = err.exit_code();
+        RepositoryLock::cleanup_all_active().await;
         if reporter_is_json() {
             let event = ProgressEvent {
                 event: "error",
@@ -166,7 +166,7 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                 meta.engine, meta.database, meta.server_version
             ));
 
-            let snapshot_short_id = hex::encode(rand::random::<[u8; 4]>());
+            let snapshot_short_id = hex::encode(rand::random::<[u8; 8]>());
             let full_id = hex::encode(rand::random::<[u8; 16]>());
 
             // Piping streaming encoder -> chunker -> repository using bounded pipe
@@ -529,20 +529,17 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                 for s in plan.remove {
                     engine.delete_snapshot(&s.id).await?;
                 }
-                lock.release().await?;
 
                 if args.prune {
                     reporter.log_info("Pruning unreferenced blobs...");
-                    let mut prune_lock =
-                        RepositoryLock::acquire(backend.clone(), LockType::Exclusive).await?;
                     let (deleted_count, deleted_bytes) = engine.prune().await?;
-                    prune_lock.release().await?;
                     reporter.log_info(&format!(
                         "Pruned {} unreferenced blob(s) ({})",
                         deleted_count,
                         format_bytes(deleted_bytes)
                     ));
                 }
+                lock.release().await?;
             }
 
             Ok(())
@@ -606,21 +603,18 @@ fn resolve_password(cli: &Cli, is_init: bool) -> Result<String, DumperError> {
         return Ok(content.trim().to_string());
     }
 
-    // Interactive prompt
+    // Interactive prompt without terminal echo
     let prompt = if is_init {
         "Enter new repository password: "
     } else {
         "Enter repository password: "
     };
 
-    eprint!("{}", prompt);
-    let mut input = String::new();
-    let stdin = io::stdin();
-    stdin.lock().read_line(&mut input).map_err(|e| {
+    let pass = rpassword::prompt_password(prompt).map_err(|e| {
         DumperError::Authentication(format!("Failed to read password from stdin: {}", e))
     })?;
 
-    let trimmed = input.trim().to_string();
+    let trimmed = pass.trim().to_string();
     if trimmed.is_empty() {
         return Err(DumperError::Authentication(
             "Password cannot be empty".into(),

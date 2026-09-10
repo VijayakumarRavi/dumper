@@ -13,10 +13,12 @@ description = "A tiny, production-grade database backup, restore, verification, 
 # Async Runtime (lightweight single-threaded or current-thread)
 bytes = { version = "1.9", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
+libc = { version = "0.2", default-features = false }
 tokio = { version = "1.43", default-features = false, features = ["rt", "macros", "time", "sync", "io-util", "net", "fs", "signal"] }
 
 # CLI Parsing
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+rpassword = { version = "7.3", default-features = false }
 
 # Cryptography
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
@@ -26,6 +28,7 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hmac = { version = "0.12", default-features = false }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 sha2 = { version = "0.10", default-features = false }
+zeroize = { version = "1.8", default-features = false, features = ["alloc", "zeroize_derive"] }
 
 # Compression
 zstd = { version = "0.13", default-features = false }
