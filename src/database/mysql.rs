@@ -48,8 +48,21 @@ pub struct MysqlAdapter {
 
 impl MysqlAdapter {
     pub fn new(url: &str) -> Self {
+        // Translate standard MySQL URL parameters (e.g. Aiven, AWS RDS) to mysql_async equivalents
+        let normalized = url
+            .replace("ssl-mode=REQUIRED", "require_ssl=true&verify_ca=false")
+            .replace("ssl-mode=required", "require_ssl=true&verify_ca=false")
+            .replace("ssl-mode=DISABLED", "require_ssl=false")
+            .replace("ssl-mode=disabled", "require_ssl=false")
+            .replace("ssl-mode=VERIFY_CA", "require_ssl=true&verify_ca=true")
+            .replace("ssl-mode=verify-ca", "require_ssl=true&verify_ca=true")
+            .replace("ssl-mode=VERIFY_IDENTITY", "require_ssl=true&verify_ca=true&verify_identity=true")
+            .replace("ssl-mode=verify-full", "require_ssl=true&verify_ca=true&verify_identity=true")
+            .replace("ssl_mode=REQUIRED", "require_ssl=true&verify_ca=false")
+            .replace("ssl_mode=required", "require_ssl=true&verify_ca=false")
+            .replace("sslmode=require", "require_ssl=true&verify_ca=false");
         Self {
-            url: url.to_string(),
+            url: normalized,
         }
     }
 
@@ -622,5 +635,11 @@ mod tests {
         assert_eq!(quote_mysql_identifier("users"), "`users`");
         assert_eq!(quote_mysql_identifier("user`name"), "`user``name`");
         assert_eq!(quote_mysql_identifier("a`b`c"), "`a``b``c`");
+    }
+
+    #[test]
+    fn test_mysql_url_ssl_mode_normalization() {
+        let adapter = MysqlAdapter::new("mysql://user:pass@host:3306/db?ssl-mode=REQUIRED");
+        assert_eq!(adapter.url, "mysql://user:pass@host:3306/db?require_ssl=true&verify_ca=false");
     }
 }
