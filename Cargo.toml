@@ -39,7 +39,7 @@ serde = { version = "1.0", default-features = false, features = ["derive", "allo
 serde_json = { version = "1.0", default-features = false, features = ["alloc", "std"] }
 
 # HTTP & URLs (for S3 API)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
 url = { version = "2.5", default-features = false }
 
 # Database Wire Protocols

@@ -54,9 +54,12 @@ pub fn evaluate_retention<'a>(
     }
 
     // Group candidates by (engine, database) so multi-database repositories do not cross-contaminate
-    let mut groups: BTreeMap<(&str, &str), Vec<&'a SnapshotMetadata>> = BTreeMap::new();
+    let mut groups: BTreeMap<(&str, &str, Option<&str>), Vec<&'a SnapshotMetadata>> = BTreeMap::new();
     for s in candidates {
-        groups.entry((&s.engine, &s.database)).or_default().push(s);
+        groups
+            .entry((&s.engine, &s.database, s.tag.as_deref()))
+            .or_default()
+            .push(s);
     }
 
     let mut kept_ids: HashSet<String> = HashSet::new();

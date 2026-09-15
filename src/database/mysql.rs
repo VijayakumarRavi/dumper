@@ -195,7 +195,9 @@ impl DatabaseAdapter for MysqlAdapter {
             let mut batch_rows = Vec::new();
             let mut slice_seq = 0u64;
 
-            while let Ok(Some(row)) = result_stream.next().await {
+            while let Some(row) = result_stream.next().await.map_err(|e| {
+                DumperError::Database(format!("MySQL stream error on table '{}': {}", table, e))
+            })? {
                 let mut row_values = Vec::new();
                 for col_idx in 0..row.len() {
                     let val: mysql_async::Value = row.get(col_idx).unwrap();
