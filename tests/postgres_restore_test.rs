@@ -1039,3 +1039,34 @@ async fn test_postgres_view_dependency_order_restoration() {
     assert_eq!(count, 2);
     assert_eq!(max_uval, "WORLD");
 }
+
+#[tokio::test]
+async fn test_postgres_libpq_key_value_connection_inspect() {
+    let _guard = PG_TEST_MUTEX.lock().await;
+
+    let pg = match TestPgServer::start() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping test: postgresql not available in test environment");
+            return;
+        }
+    };
+
+    assert!(pg.createdb("libpq_kv_db"));
+
+    let kv_conn = format!(
+        "host=127.0.0.1 port={} user=postgres dbname=libpq_kv_db",
+        pg.port
+    );
+
+    let adapter = dumper::database::AnyDatabaseAdapter::from_url(&kv_conn)
+        .expect("Should construct adapter from libpq key-value string");
+
+    let meta = adapter
+        .inspect()
+        .await
+        .expect("Should inspect PostgreSQL database using libpq key-value connection");
+
+    assert_eq!(meta.engine, "postgresql");
+    assert_eq!(meta.database, "libpq_kv_db");
+}

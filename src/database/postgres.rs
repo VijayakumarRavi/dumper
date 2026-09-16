@@ -108,7 +108,8 @@ impl PostgresAdapter {
         let mut config: tokio_postgres::Config = self.url.parse().map_err(|e| {
             DumperError::Database(format!(
                 "Invalid PostgreSQL connection URL '{}': {}",
-                self.url, e
+                crate::error::sanitize_secrets(&self.url),
+                e
             ))
         })?;
 

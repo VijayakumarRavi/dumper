@@ -506,3 +506,30 @@ async fn test_mysql_binary_and_text_columns_roundtrip() {
     let hex_blob = mysql.query("SELECT HEX(blob_col) FROM binary_test WHERE id = 1;");
     assert_eq!(hex_blob, "000102FFFE000304");
 }
+
+#[tokio::test]
+async fn test_mysql_key_value_connection_inspect() {
+    let mysql = match TestMysqlServer::start() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping test: mariadb not available");
+            return;
+        }
+    };
+
+    let kv_conn = format!(
+        "host=127.0.0.1 port={} user=root database=testdb",
+        mysql.port
+    );
+
+    let adapter = dumper::database::AnyDatabaseAdapter::from_url(&kv_conn)
+        .expect("Should construct adapter from MySQL key-value string");
+
+    let meta = adapter
+        .inspect()
+        .await
+        .expect("Should inspect MySQL database using key-value connection");
+
+    assert_eq!(meta.engine, "mysql");
+    assert_eq!(meta.database, "testdb");
+}
