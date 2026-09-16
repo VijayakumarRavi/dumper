@@ -954,3 +954,88 @@ async fn test_postgres_concurrent_write_consistency() {
         count
     );
 }
+
+#[tokio::test]
+async fn test_postgres_view_dependency_order_restoration() {
+    let _guard = PG_TEST_MUTEX.lock().await;
+
+    let pg = match TestPgServer::start() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping test: postgresql not available in test environment");
+            return;
+        }
+    };
+
+    let source_db = "view_dep_source";
+    let target_db = "view_dep_target";
+    assert!(pg.createdb(source_db));
+    assert!(pg.createdb(target_db));
+
+    let source_url = format!("postgres://postgres@127.0.0.1:{}/{}", pg.port, source_db);
+    let target_url = format!("postgres://postgres@127.0.0.1:{}/{}", pg.port, target_db);
+
+    // Populate source DB with base table and views where dependent view is alphabetically FIRST:
+    // "a_dependent_view" depends on "z_base_view".
+    // If ordered alphabetically, restoring "a_dependent_view" would fail because "z_base_view" doesn't exist yet.
+    {
+        let (client, conn) = tokio_postgres::connect(&source_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        client
+            .batch_execute(
+                "CREATE TABLE raw_data (id INT PRIMARY KEY, val TEXT);
+                 INSERT INTO raw_data VALUES (1, 'hello'), (2, 'world');
+                 CREATE VIEW z_base_view AS SELECT id, val FROM raw_data WHERE id > 0;
+                 CREATE VIEW a_dependent_view AS SELECT id, upper(val) AS uval FROM z_base_view;",
+            )
+            .await
+            .unwrap();
+    }
+
+    // Backup source DB
+    let adapter = PostgresAdapter::new(&source_url);
+    let mut backup_buf = Vec::new();
+    {
+        let mut encoder = StreamEncoder::new(&mut backup_buf);
+        let stats = adapter.backup(&mut encoder).await.unwrap();
+        assert_eq!(stats.tables_backed_up, 1);
+        encoder.finish().await.unwrap();
+    }
+
+    // Restore into target DB
+    let restore_adapter = PostgresAdapter::new(&target_url);
+    let mut decoder = StreamDecoder::new(&backup_buf[..]);
+    let restore_stats = restore_adapter
+        .restore(
+            &mut decoder,
+            &RestoreOptions {
+                target_database_override: None,
+                drop_existing: false,
+            },
+        )
+        .await
+        .expect("Restore must succeed by creating z_base_view before a_dependent_view");
+    assert_eq!(restore_stats.tables_restored, 1);
+
+    // Verify both views exist and return expected data in restored DB
+    let (client, conn) = tokio_postgres::connect(&target_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let row = client
+        .query_one("SELECT count(*), max(uval) FROM a_dependent_view", &[])
+        .await
+        .unwrap();
+    let count: i64 = row.get(0);
+    let max_uval: String = row.get(1);
+    assert_eq!(count, 2);
+    assert_eq!(max_uval, "WORLD");
+}
