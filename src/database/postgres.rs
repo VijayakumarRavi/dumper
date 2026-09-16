@@ -355,7 +355,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query custom types (ENUM/DOMAIN): {}", e))
+            })?;
 
         for row in type_rows {
             let schema: String = row.get(0);
@@ -387,7 +389,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query sequence definitions: {}", e))
+            })?;
 
         for srow in seq_ddl_rows {
             let schema: String = srow.get(0);
@@ -524,7 +528,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query sequence values: {}", e))
+            })?;
 
         for srow in seq_rows {
             let schema: String = srow.get(0);
@@ -564,7 +570,12 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!(
+                    "Failed to query views and materialized views: {}",
+                    e
+                ))
+            })?;
 
         for vrow in view_rows {
             let schema: String = vrow.get(0);
@@ -612,7 +623,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query custom types (ENUM/DOMAIN): {}", e))
+            })?;
 
         for row in func_rows {
             let schema: String = row.get(0);
@@ -646,7 +659,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query secondary indexes: {}", e))
+            })?;
 
         for irow in index_rows {
             let schema: String = irow.get(0);
@@ -677,7 +692,12 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!(
+                    "Failed to query constraints (PK/FK/UNIQUE/CHECK): {}",
+                    e
+                ))
+            })?;
 
         for row in constraint_rows {
             let schema: String = row.get(0);
@@ -709,7 +729,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query triggers: {}", e))
+            })?;
 
         for row in trigger_rows {
             let schema: String = row.get(0);
