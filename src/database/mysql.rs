@@ -497,7 +497,7 @@ impl DatabaseAdapter for MysqlAdapter {
         let mut conn = self.get_conn().await?;
 
         // Disable integrity checks for restore
-        conn.query_drop("SET FOREIGN_KEY_CHECKS = 0; SET UNIQUE_CHECKS = 0; SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO';")
+        conn.query_drop("SET FOREIGN_KEY_CHECKS = 0; SET UNIQUE_CHECKS = 0; SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO,ANSI_QUOTES';")
             .await
             .map_err(|e| DumperError::Restore(format!("Failed to set restore session variables: {}", e)))?;
 

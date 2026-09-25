@@ -222,8 +222,8 @@ impl DatabaseAdapter for PostgresAdapter {
                  FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE c.relkind = 'r' \
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
-                   AND n.nspname NOT LIKE 'pg_temp_%' \
+                   AND n.nspname NOT LIKE 'pg_%' \
+                   AND n.nspname != 'information_schema' \
                  ORDER BY n.nspname, c.relname",
                 &[],
             )
@@ -286,8 +286,8 @@ impl DatabaseAdapter for PostgresAdapter {
                  FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE c.relkind = 'r' \
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
-                   AND n.nspname NOT LIKE 'pg_temp_%' \
+                   AND n.nspname NOT LIKE 'pg_%' \
+                   AND n.nspname != 'information_schema' \
                  ORDER BY n.nspname, c.relname",
                 &[],
             )
@@ -312,12 +312,36 @@ impl DatabaseAdapter for PostgresAdapter {
         };
         encoder.write_record(&StreamRecord::Header(header)).await?;
 
+        // 3. Extensions (e.g. citext, pgcrypto, uuid-ossp)
+        let ext_rows = client
+            .query(
+                "SELECT extname FROM pg_extension WHERE extname != 'plpgsql' ORDER BY extname",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query PostgreSQL extensions: {}", e))
+            })?;
+
+        for erow in ext_rows {
+            let extname: String = erow.get(0);
+            encoder
+                .write_record(&StreamRecord::PreData(PreDataRecord {
+                    name: format!("extension:{}", extname),
+                    sql: format!(
+                        "CREATE EXTENSION IF NOT EXISTS {};",
+                        quote_pg_identifier(&extname)
+                    ),
+                }))
+                .await?;
+        }
+
         // 4. User Schemas
         let schema_rows = client
             .query(
                 "SELECT nspname FROM pg_namespace \
-                 WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
-                   AND nspname NOT LIKE 'pg_temp_%' \
+                 WHERE nspname NOT LIKE 'pg_%' \
+                   AND nspname != 'information_schema' \
                  ORDER BY nspname",
                 &[],
             )
@@ -342,35 +366,42 @@ impl DatabaseAdapter for PostgresAdapter {
         // 3.5 Custom Types (ENUM, DOMAIN)
         let type_rows = client
             .query(
-                "SELECT n.nspname, t.typname, 
-                  CASE 
-                    WHEN t.typtype = 'e' THEN 'CREATE TYPE \"' || n.nspname || '\".\"' || t.typname || '\" AS ENUM (' || 
+                "SELECT n.nspname, t.typname,
+                  CASE
+                    WHEN t.typtype = 'e' THEN 'CREATE TYPE \"' || n.nspname || '\".\"' || t.typname || '\" AS ENUM (' ||
                       (SELECT string_agg(quote_literal(enumlabel), ', ') FROM pg_enum WHERE enumtypid = t.oid) || ');'
-                    WHEN t.typtype = 'd' THEN 'CREATE DOMAIN \"' || n.nspname || '\".\"' || t.typname || '\" AS ' || format_type(t.typbasetype, t.typtypmod) || 
+                    WHEN t.typtype = 'd' THEN 'CREATE DOMAIN \"' || n.nspname || '\".\"' || t.typname || '\" AS ' || format_type(t.typbasetype, t.typtypmod) ||
                       COALESCE(' DEFAULT ' || t.typdefault, '') || ';'
                   END as def
                 FROM pg_type t
                 JOIN pg_namespace n ON n.oid = t.typnamespace
-                WHERE t.typtype IN ('e', 'd') 
-                  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-                  AND n.nspname NOT LIKE 'pg_temp_%'",
+                WHERE t.typtype IN ('e', 'd')
+                  AND n.nspname NOT LIKE 'pg_%'
+                  AND n.nspname != 'information_schema'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM pg_depend d
+                    WHERE d.classid = 'pg_type'::regclass
+                      AND d.objid = t.oid
+                      AND d.deptype = 'e'
+                  )",
                 &[],
             )
             .await
             .map_err(|e| {
-                DumperError::Database(format!("Failed to query custom types (ENUM/DOMAIN): {}", e))
+                DumperError::Database(format!("Failed to query custom types (ENUM/DOMAIN): {:?}", e))
             })?;
 
         for row in type_rows {
             let schema: String = row.get(0);
             let name: String = row.get(1);
-            let def: String = row.get(2);
-            encoder
-                .write_record(&StreamRecord::PreData(PreDataRecord {
-                    name: format!("{}.{}", schema, name),
-                    sql: def,
-                }))
-                .await?;
+            if let Some(def) = row.get::<_, Option<String>>(2) {
+                encoder
+                    .write_record(&StreamRecord::PreData(PreDataRecord {
+                        name: format!("{}.{}", schema, name),
+                        sql: def,
+                    }))
+                    .await?;
+            }
         }
 
         // 3.6 Sequence Definitions
@@ -386,7 +417,7 @@ impl DatabaseAdapter for PostgresAdapter {
                  CASE WHEN cycle THEN ' CYCLE' ELSE ' NO CYCLE' END || \
                  ' CACHE ' || cache_size || ';' \
                  FROM pg_sequences \
-                 WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
+                 WHERE schemaname NOT LIKE 'pg_%' AND schemaname != 'information_schema' \
                  ORDER BY schemaname, sequencename",
                 &[],
             )
@@ -525,7 +556,7 @@ impl DatabaseAdapter for PostgresAdapter {
                  FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE c.relkind = 'S' \
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                   AND n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema' \
                  ORDER BY n.nspname, c.relname",
                 &[],
             )
@@ -567,7 +598,7 @@ impl DatabaseAdapter for PostgresAdapter {
                  FROM pg_class c
                  JOIN pg_namespace n ON n.oid = c.relnamespace
                  WHERE c.relkind IN ('v', 'm')
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                   AND n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema'
                  ORDER BY n.nspname, c.relname",
                 &[],
             )
@@ -663,14 +694,19 @@ impl DatabaseAdapter for PostgresAdapter {
                 "SELECT n.nspname, p.proname, pg_get_functiondef(p.oid)
                  FROM pg_proc p
                  JOIN pg_namespace n ON n.oid = p.pronamespace
-                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-                   AND n.nspname NOT LIKE 'pg_temp_%'",
+                 WHERE p.prokind IN ('f', 'p')
+                   AND n.nspname NOT LIKE 'pg_%'
+                   AND n.nspname != 'information_schema'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM pg_depend d
+                     WHERE d.classid = 'pg_proc'::regclass
+                       AND d.objid = p.oid
+                       AND d.deptype = 'e'
+                   )",
                 &[],
             )
             .await
-            .map_err(|e| {
-                DumperError::Database(format!("Failed to query custom types (ENUM/DOMAIN): {}", e))
-            })?;
+            .map_err(|e| DumperError::Database(format!("Failed to query functions: {}", e)))?;
 
         for row in func_rows {
             let schema: String = row.get(0);
@@ -770,7 +806,7 @@ impl DatabaseAdapter for PostgresAdapter {
                  JOIN pg_class c ON t.tgrelid = c.oid
                  JOIN pg_namespace n ON c.relnamespace = n.oid
                  WHERE NOT t.tgisinternal
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')",
+                   AND n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema'",
                 &[],
             )
             .await
@@ -836,8 +872,31 @@ impl DatabaseAdapter for PostgresAdapter {
                     }
                 }
                 StreamRecord::PreData(p) => {
+                    let trimmed = p.sql.trim();
+                    if trimmed.to_ascii_uppercase().starts_with("CREATE SCHEMA")
+                        && (p.name.starts_with("pg_")
+                            || p.name.starts_with("\"pg_")
+                            || p.name.contains("pg_temp")
+                            || p.name.contains("pg_toast"))
+                    {
+                        eprintln!("Skipping restore of reserved system schema '{}'", p.name);
+                        continue;
+                    }
                     client.batch_execute(&p.sql).await.map_err(|e| {
-                        DumperError::Restore(format!("Failed to execute pre-data DDL: {}", e))
+                        let detail = if let Some(dbe) = e.as_db_error() {
+                            format!(
+                                "{}: {} (code: {:?})",
+                                dbe.message(),
+                                dbe.detail().unwrap_or(""),
+                                dbe.code()
+                            )
+                        } else {
+                            e.to_string()
+                        };
+                        DumperError::Restore(format!(
+                            "Failed to execute pre-data DDL for '{}' (SQL: '{}'): {}",
+                            p.name, p.sql, detail
+                        ))
                     })?;
                 }
                 StreamRecord::TableSchema(s) => {

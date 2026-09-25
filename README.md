@@ -54,13 +54,21 @@ dumper init
 #### PostgreSQL
 
 ```bash
+# URI format
 dumper backup postgres://app_user:secret@localhost:5432/production_db
+
+# libpq key-value format
+dumper backup "host=localhost port=5432 user=app_user password=secret dbname=production_db"
 ```
 
 #### MySQL / MariaDB
 
 ```bash
+# URI format
 dumper backup mysql://app_user:secret@localhost:3306/production_db
+
+# Key-value / semicolon format
+dumper backup "host=localhost port=3306 user=app_user password=secret database=production_db"
 ```
 
 ### 3. List Snapshots

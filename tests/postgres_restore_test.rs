@@ -1070,3 +1070,164 @@ async fn test_postgres_libpq_key_value_connection_inspect() {
     assert_eq!(meta.engine, "postgresql");
     assert_eq!(meta.database, "libpq_kv_db");
 }
+
+#[tokio::test]
+async fn test_postgres_libpq_key_value_backup_restore_roundtrip() {
+    let _guard = PG_TEST_MUTEX.lock().await;
+
+    let pg = match TestPgServer::start() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping test: postgresql not available in test environment");
+            return;
+        }
+    };
+
+    assert!(pg.createdb("libpq_src"));
+    assert!(pg.createdb("libpq_dest"));
+
+    let kv_src = format!(
+        "host=127.0.0.1 port={} user=postgres dbname=libpq_src sslmode=disable",
+        pg.port
+    );
+    let kv_dest = format!(
+        "host=127.0.0.1 port={} user=postgres dbname=libpq_dest sslmode=disable",
+        pg.port
+    );
+
+    // Populate source database
+    let (client, conn) = tokio_postgres::connect(&kv_src, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    client
+        .batch_execute(
+            "CREATE TABLE kv_items (
+                 id SERIAL PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 qty INT NOT NULL
+             );
+             INSERT INTO kv_items (name, qty) VALUES ('Apple', 10), ('Banana', 25);",
+        )
+        .await
+        .unwrap();
+
+    // Backup via libpq key-value connection string
+    let src_adapter = dumper::database::AnyDatabaseAdapter::from_url(&kv_src).unwrap();
+    let mut buffer = Vec::new();
+    let mut encoder = StreamEncoder::new(&mut buffer);
+    let b_stats = src_adapter.backup(&mut encoder).await.unwrap();
+    encoder.finish().await.unwrap();
+    assert_eq!(b_stats.tables_backed_up, 1);
+
+    // Restore via libpq key-value connection string
+    let dest_adapter = dumper::database::AnyDatabaseAdapter::from_url(&kv_dest).unwrap();
+    let mut decoder = StreamDecoder::new(buffer.as_slice());
+    let r_options = RestoreOptions {
+        target_database_override: None,
+        drop_existing: true,
+    };
+    let r_stats = dest_adapter
+        .restore(&mut decoder, &r_options)
+        .await
+        .unwrap();
+    assert_eq!(r_stats.tables_restored, 1);
+
+    // Verify restored records in destination
+    let (dest_client, dest_conn) = tokio_postgres::connect(&kv_dest, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = dest_conn.await;
+    });
+
+    let count_row = dest_client
+        .query_one("SELECT count(*), sum(qty) FROM kv_items", &[])
+        .await
+        .unwrap();
+    let count: i64 = count_row.get(0);
+    let total_qty: i64 = count_row.get(1);
+    assert_eq!(count, 2);
+    assert_eq!(total_qty, 35);
+}
+
+#[tokio::test]
+async fn test_postgres_extension_and_reserved_schema_roundtrip() {
+    let _guard = PG_TEST_MUTEX.lock().await;
+
+    let pg = match TestPgServer::start() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping test: postgresql not available in test environment");
+            return;
+        }
+    };
+
+    assert!(pg.createdb("ext_src_db"));
+    assert!(pg.createdb("ext_dest_db"));
+
+    let src_url = format!("postgres://postgres@127.0.0.1:{}/ext_src_db", pg.port);
+    let dest_url = format!("postgres://postgres@127.0.0.1:{}/ext_dest_db", pg.port);
+
+    // Setup source with citext extension and table
+    let (client, conn) = tokio_postgres::connect(&src_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    client
+        .batch_execute(
+            "CREATE EXTENSION IF NOT EXISTS citext;
+             CREATE TABLE contacts (
+                 id SERIAL PRIMARY KEY,
+                 email citext NOT NULL
+             );
+             INSERT INTO contacts (email) VALUES ('User@Example.Com');",
+        )
+        .await
+        .unwrap();
+
+    let adapter = PostgresAdapter::new(&src_url);
+    let mut buffer = Vec::new();
+    let mut encoder = StreamEncoder::new(&mut buffer);
+
+    let stats = adapter.backup(&mut encoder).await.unwrap();
+    encoder.finish().await.unwrap();
+    assert_eq!(stats.tables_backed_up, 1);
+
+    // Restore to destination
+    let dest_adapter = PostgresAdapter::new(&dest_url);
+    let mut decoder = StreamDecoder::new(buffer.as_slice());
+    let r_options = RestoreOptions {
+        target_database_override: None,
+        drop_existing: true,
+    };
+    let r_stats = dest_adapter
+        .restore(&mut decoder, &r_options)
+        .await
+        .unwrap();
+    assert_eq!(r_stats.tables_restored, 1);
+
+    // Verify citext case-insensitive query in destination
+    let (dest_client, dest_conn) = tokio_postgres::connect(&dest_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = dest_conn.await;
+    });
+
+    let row = dest_client
+        .query_one(
+            "SELECT email FROM contacts WHERE email = 'user@example.com'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let email: String = row.get(0);
+    assert_eq!(email, "User@Example.Com");
+}
