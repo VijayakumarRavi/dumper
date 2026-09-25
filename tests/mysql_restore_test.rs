@@ -428,3 +428,108 @@ async fn test_mysql_restore_transaction_rollback_on_failure() {
         "Transaction rollback in failed slice must leave exactly 5 rows from committed slice 1"
     );
 }
+
+#[tokio::test]
+async fn test_mysql_binary_and_text_columns_roundtrip() {
+    let mysql = match TestMysqlServer::start() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping test: mariadb not available");
+            return;
+        }
+    };
+
+    // Create table with VARCHAR, TEXT, VARBINARY, and BLOB columns
+    mysql.query(
+        "CREATE TABLE binary_test (
+            id INT PRIMARY KEY,
+            str_col VARCHAR(100),
+            text_col TEXT,
+            varbin_col VARBINARY(100),
+            blob_col BLOB
+        );",
+    );
+
+    // Insert data:
+    // varbin_col contains bytes that happen to be valid ASCII/UTF-8 ("valid utf8")
+    // blob_col contains arbitrary binary bytes including null bytes and non-UTF-8 bytes
+    mysql.query(
+        "INSERT INTO binary_test VALUES (
+            1,
+            'standard text',
+            'longer text with \\'quotes\\' and \\n newlines',
+            0x76616c69642075746638,
+            0x000102fffe000304
+        );",
+    );
+
+    let adapter = MysqlAdapter::new(&mysql.url());
+
+    // Run backup
+    let mut buffer = Vec::new();
+    {
+        let mut encoder = StreamEncoder::new(&mut buffer);
+        let stats = adapter
+            .backup(&mut encoder)
+            .await
+            .expect("Backup should succeed");
+        assert_eq!(stats.tables_backed_up, 1);
+        assert_eq!(stats.rows_backed_up, 1);
+        encoder.finish().await.expect("Finish stream");
+    }
+
+    // Drop table to simulate restore into clean DB
+    mysql.query("DROP TABLE binary_test;");
+
+    // Run restore
+    let mut decoder = StreamDecoder::new(&buffer[..]);
+    let options = RestoreOptions {
+        target_database_override: None,
+        drop_existing: true,
+    };
+    let restore_stats = adapter
+        .restore(&mut decoder, &options)
+        .await
+        .expect("Restore should succeed");
+    assert_eq!(restore_stats.tables_restored, 1);
+
+    // Verify data matches exactly
+    let str_val = mysql.query("SELECT str_col FROM binary_test WHERE id = 1;");
+    assert_eq!(str_val, "standard text");
+
+    let text_val = mysql.query("SELECT text_col FROM binary_test WHERE id = 1;");
+    assert_eq!(text_val, "longer text with 'quotes' and \\n newlines");
+
+    let hex_varbin = mysql.query("SELECT HEX(varbin_col) FROM binary_test WHERE id = 1;");
+    assert_eq!(hex_varbin, "76616C69642075746638");
+
+    let hex_blob = mysql.query("SELECT HEX(blob_col) FROM binary_test WHERE id = 1;");
+    assert_eq!(hex_blob, "000102FFFE000304");
+}
+
+#[tokio::test]
+async fn test_mysql_key_value_connection_inspect() {
+    let mysql = match TestMysqlServer::start() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping test: mariadb not available");
+            return;
+        }
+    };
+
+    let kv_conn = format!(
+        "host=127.0.0.1 port={} user=root database=testdb",
+        mysql.port
+    );
+
+    let adapter = dumper::database::AnyDatabaseAdapter::from_url(&kv_conn)
+        .expect("Should construct adapter from MySQL key-value string");
+
+    let meta = adapter
+        .inspect()
+        .await
+        .expect("Should inspect MySQL database using key-value connection");
+
+    assert_eq!(meta.engine, "mysql");
+    assert_eq!(meta.database, "testdb");
+}

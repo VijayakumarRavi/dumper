@@ -3,9 +3,11 @@ use crate::error::DumperError;
 use crate::stream::decoder::StreamDecoder;
 use crate::stream::encoder::StreamEncoder;
 use crate::stream::format::*;
+use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, Pool};
+use mysql_async::{Column, Conn, Opts, Pool};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -13,6 +15,34 @@ pub enum MysqlValue {
     Null,
     String(String),
     Bytes(Vec<u8>),
+}
+
+/// Determines if a MySQL column contains binary data rather than text.
+/// In MySQL wire protocol, charset 63 is the 'binary' collation (used by BINARY, VARBINARY,
+/// BLOB, TINYBLOB, MEDIUMBLOB, LONGBLOB, and GEOMETRY).
+/// Note: TEXT types share MYSQL_TYPE_BLOB with BLOB, but have a non-binary character_set (e.g. utf8mb4).
+pub fn is_binary_column(col: &Column) -> bool {
+    let is_blob_type = matches!(
+        col.column_type(),
+        ColumnType::MYSQL_TYPE_BLOB
+            | ColumnType::MYSQL_TYPE_TINY_BLOB
+            | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+            | ColumnType::MYSQL_TYPE_LONG_BLOB
+    );
+    let has_binary_flag = col.flags().contains(ColumnFlags::BINARY_FLAG);
+    let is_binary_charset = col.character_set() == 63;
+    let is_geometry = col.column_type() == ColumnType::MYSQL_TYPE_GEOMETRY;
+
+    is_geometry || (is_blob_type && is_binary_charset) || (has_binary_flag && is_binary_charset)
+}
+
+pub fn find_binary_columns(columns: &[Column]) -> HashSet<usize> {
+    columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| is_binary_column(col))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Escapes a string for safe inclusion in a MySQL string literal enclosed in single quotes.
@@ -56,14 +86,18 @@ impl MysqlAdapter {
             .replace("ssl-mode=disabled", "require_ssl=false")
             .replace("ssl-mode=VERIFY_CA", "require_ssl=true&verify_ca=true")
             .replace("ssl-mode=verify-ca", "require_ssl=true&verify_ca=true")
-            .replace("ssl-mode=VERIFY_IDENTITY", "require_ssl=true&verify_ca=true&verify_identity=true")
-            .replace("ssl-mode=verify-full", "require_ssl=true&verify_ca=true&verify_identity=true")
+            .replace(
+                "ssl-mode=VERIFY_IDENTITY",
+                "require_ssl=true&verify_ca=true&verify_identity=true",
+            )
+            .replace(
+                "ssl-mode=verify-full",
+                "require_ssl=true&verify_ca=true&verify_identity=true",
+            )
             .replace("ssl_mode=REQUIRED", "require_ssl=true&verify_ca=false")
             .replace("ssl_mode=required", "require_ssl=true&verify_ca=false")
             .replace("sslmode=require", "require_ssl=true&verify_ca=false");
-        Self {
-            url: normalized,
-        }
+        Self { url: normalized }
     }
 
     async fn get_conn(&self) -> Result<Conn, DumperError> {
@@ -148,23 +182,34 @@ impl DatabaseAdapter for MysqlAdapter {
         for (db, table) in &meta.table_names {
             // Get CREATE TABLE statement
             let show_create_query = format!("SHOW CREATE TABLE {}", quote_mysql_identifier(table));
-            let show_row: Option<(String, String)> = conn
+            let show_row: (String, String) = conn
                 .query_first(&show_create_query)
                 .await
-                .map_err(|e| DumperError::Database(e.to_string()))?;
+                .map_err(|e| {
+                    DumperError::Database(format!(
+                        "Failed to query schema for table '{}': {}",
+                        table, e
+                    ))
+                })?
+                .ok_or_else(|| {
+                    DumperError::Database(format!("Table '{}' definition not found", table))
+                })?;
 
-            let create_sql = show_row
-                .map(|(_, sql)| format!("{};", sql))
-                .unwrap_or_default();
+            let create_sql = format!("{};", show_row.1);
 
             let cols_query = format!(
                 "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = {} AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position",
                 escape_mysql_string(table)
             );
-            let col_names: Vec<String> = conn
-                .query_map(&cols_query, |c: String| c)
-                .await
-                .unwrap_or_default();
+            let col_names: Vec<String> =
+                conn.query_map(&cols_query, |c: String| c)
+                    .await
+                    .map_err(|e| {
+                        DumperError::Database(format!(
+                            "Failed to query columns for table '{}': {}",
+                            table, e
+                        ))
+                    })?;
             let columns = col_names
                 .iter()
                 .map(|c| TableColumnMeta {
@@ -207,20 +252,30 @@ impl DatabaseAdapter for MysqlAdapter {
 
             let mut batch_rows = Vec::new();
             let mut slice_seq = 0u64;
+            let mut binary_cols: Option<HashSet<usize>> = None;
 
             while let Some(row) = result_stream.next().await.map_err(|e| {
                 DumperError::Database(format!("MySQL stream error on table '{}': {}", table, e))
             })? {
+                let binary_indices = match &binary_cols {
+                    Some(indices) => indices,
+                    None => {
+                        let indices = find_binary_columns(row.columns_ref());
+                        binary_cols = Some(indices);
+                        binary_cols.as_ref().unwrap()
+                    }
+                };
+
                 let mut row_values = Vec::new();
                 for col_idx in 0..row.len() {
                     let val: mysql_async::Value = row.get(col_idx).unwrap();
                     let mval = match val {
                         mysql_async::Value::NULL => MysqlValue::Null,
                         mysql_async::Value::Bytes(b) => {
-                            if let Ok(s) = String::from_utf8(b.clone()) {
-                                MysqlValue::String(s)
-                            } else {
+                            if binary_indices.contains(&col_idx) {
                                 MysqlValue::Bytes(b)
+                            } else {
+                                MysqlValue::String(String::from_utf8_lossy(&b).into_owned())
                             }
                         }
                         mysql_async::Value::Int(i) => MysqlValue::String(i.to_string()),
@@ -305,7 +360,7 @@ impl DatabaseAdapter for MysqlAdapter {
                 |(t, v): (String, String)| (t, v),
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| DumperError::Database(format!("Failed to query MySQL views: {}", e)))?;
 
         for (vname, vdef) in views {
             let sql = format!(
@@ -342,7 +397,7 @@ impl DatabaseAdapter for MysqlAdapter {
                 (trigger, sql)
             })
             .await
-            .unwrap_or_default();
+            .map_err(|e| DumperError::Database(format!("Failed to query MySQL triggers: {}", e)))?;
 
         for (trig_name, trig_sql) in triggers {
             encoder
@@ -362,11 +417,19 @@ impl DatabaseAdapter for MysqlAdapter {
                 |mut row: mysql_async::Row| row.take("Name").unwrap(),
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query MySQL procedures: {}", e))
+            })?;
 
         for p in procs {
             let q = format!("SHOW CREATE PROCEDURE {}", quote_mysql_identifier(&p));
-            if let Ok(Some(mut row)) = conn.query_first::<mysql_async::Row, _>(&q).await {
+            let row = conn
+                .query_first::<mysql_async::Row, _>(&q)
+                .await
+                .map_err(|e| {
+                    DumperError::Database(format!("Failed to query procedure '{}': {}", p, e))
+                })?;
+            if let Some(mut row) = row {
                 if let Some(def) = row.take("Create Procedure") {
                     let def: String = def;
                     encoder
@@ -387,11 +450,19 @@ impl DatabaseAdapter for MysqlAdapter {
                 |mut row: mysql_async::Row| row.take("Name").unwrap(),
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query MySQL functions: {}", e))
+            })?;
 
         for f in funcs {
             let q = format!("SHOW CREATE FUNCTION {}", quote_mysql_identifier(&f));
-            if let Ok(Some(mut row)) = conn.query_first::<mysql_async::Row, _>(&q).await {
+            let row = conn
+                .query_first::<mysql_async::Row, _>(&q)
+                .await
+                .map_err(|e| {
+                    DumperError::Database(format!("Failed to query function '{}': {}", f, e))
+                })?;
+            if let Some(mut row) = row {
                 if let Some(def) = row.take("Create Function") {
                     let def: String = def;
                     encoder
@@ -426,7 +497,7 @@ impl DatabaseAdapter for MysqlAdapter {
         let mut conn = self.get_conn().await?;
 
         // Disable integrity checks for restore
-        conn.query_drop("SET FOREIGN_KEY_CHECKS = 0; SET UNIQUE_CHECKS = 0; SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO';")
+        conn.query_drop("SET FOREIGN_KEY_CHECKS = 0; SET UNIQUE_CHECKS = 0; SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO,ANSI_QUOTES';")
             .await
             .map_err(|e| DumperError::Restore(format!("Failed to set restore session variables: {}", e)))?;
 
@@ -488,7 +559,12 @@ impl DatabaseAdapter for MysqlAdapter {
                                 let cols: Vec<String> = conn
                                     .query_map(&cols_query, |c: String| quote_mysql_identifier(&c))
                                     .await
-                                    .unwrap_or_default();
+                                    .map_err(|e| {
+                                        DumperError::Restore(format!(
+                                            "Failed to query columns for table '{}': {}",
+                                            d.table_name, e
+                                        ))
+                                    })?;
                                 let cols_str = cols.join(", ");
                                 table_columns_cache.insert(d.table_name.clone(), cols_str.clone());
                                 cols_str
@@ -640,6 +716,9 @@ mod tests {
     #[test]
     fn test_mysql_url_ssl_mode_normalization() {
         let adapter = MysqlAdapter::new("mysql://user:pass@host:3306/db?ssl-mode=REQUIRED");
-        assert_eq!(adapter.url, "mysql://user:pass@host:3306/db?require_ssl=true&verify_ca=false");
+        assert_eq!(
+            adapter.url,
+            "mysql://user:pass@host:3306/db?require_ssl=true&verify_ca=false"
+        );
     }
 }

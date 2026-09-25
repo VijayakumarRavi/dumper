@@ -6,6 +6,7 @@ use crate::stream::format::*;
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -107,7 +108,8 @@ impl PostgresAdapter {
         let mut config: tokio_postgres::Config = self.url.parse().map_err(|e| {
             DumperError::Database(format!(
                 "Invalid PostgreSQL connection URL '{}': {}",
-                self.url, e
+                crate::error::sanitize_secrets(&self.url),
+                e
             ))
         })?;
 
@@ -220,8 +222,8 @@ impl DatabaseAdapter for PostgresAdapter {
                  FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE c.relkind = 'r' \
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
-                   AND n.nspname NOT LIKE 'pg_temp_%' \
+                   AND n.nspname NOT LIKE 'pg_%' \
+                   AND n.nspname != 'information_schema' \
                  ORDER BY n.nspname, c.relname",
                 &[],
             )
@@ -284,8 +286,8 @@ impl DatabaseAdapter for PostgresAdapter {
                  FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE c.relkind = 'r' \
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
-                   AND n.nspname NOT LIKE 'pg_temp_%' \
+                   AND n.nspname NOT LIKE 'pg_%' \
+                   AND n.nspname != 'information_schema' \
                  ORDER BY n.nspname, c.relname",
                 &[],
             )
@@ -310,12 +312,36 @@ impl DatabaseAdapter for PostgresAdapter {
         };
         encoder.write_record(&StreamRecord::Header(header)).await?;
 
+        // 3. Extensions (e.g. citext, pgcrypto, uuid-ossp)
+        let ext_rows = client
+            .query(
+                "SELECT extname FROM pg_extension WHERE extname != 'plpgsql' ORDER BY extname",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query PostgreSQL extensions: {}", e))
+            })?;
+
+        for erow in ext_rows {
+            let extname: String = erow.get(0);
+            encoder
+                .write_record(&StreamRecord::PreData(PreDataRecord {
+                    name: format!("extension:{}", extname),
+                    sql: format!(
+                        "CREATE EXTENSION IF NOT EXISTS {};",
+                        quote_pg_identifier(&extname)
+                    ),
+                }))
+                .await?;
+        }
+
         // 4. User Schemas
         let schema_rows = client
             .query(
                 "SELECT nspname FROM pg_namespace \
-                 WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
-                   AND nspname NOT LIKE 'pg_temp_%' \
+                 WHERE nspname NOT LIKE 'pg_%' \
+                   AND nspname != 'information_schema' \
                  ORDER BY nspname",
                 &[],
             )
@@ -340,33 +366,42 @@ impl DatabaseAdapter for PostgresAdapter {
         // 3.5 Custom Types (ENUM, DOMAIN)
         let type_rows = client
             .query(
-                "SELECT n.nspname, t.typname, 
-                  CASE 
-                    WHEN t.typtype = 'e' THEN 'CREATE TYPE \"' || n.nspname || '\".\"' || t.typname || '\" AS ENUM (' || 
+                "SELECT n.nspname, t.typname,
+                  CASE
+                    WHEN t.typtype = 'e' THEN 'CREATE TYPE \"' || n.nspname || '\".\"' || t.typname || '\" AS ENUM (' ||
                       (SELECT string_agg(quote_literal(enumlabel), ', ') FROM pg_enum WHERE enumtypid = t.oid) || ');'
-                    WHEN t.typtype = 'd' THEN 'CREATE DOMAIN \"' || n.nspname || '\".\"' || t.typname || '\" AS ' || format_type(t.typbasetype, t.typtypmod) || 
+                    WHEN t.typtype = 'd' THEN 'CREATE DOMAIN \"' || n.nspname || '\".\"' || t.typname || '\" AS ' || format_type(t.typbasetype, t.typtypmod) ||
                       COALESCE(' DEFAULT ' || t.typdefault, '') || ';'
                   END as def
                 FROM pg_type t
                 JOIN pg_namespace n ON n.oid = t.typnamespace
-                WHERE t.typtype IN ('e', 'd') 
-                  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-                  AND n.nspname NOT LIKE 'pg_temp_%'",
+                WHERE t.typtype IN ('e', 'd')
+                  AND n.nspname NOT LIKE 'pg_%'
+                  AND n.nspname != 'information_schema'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM pg_depend d
+                    WHERE d.classid = 'pg_type'::regclass
+                      AND d.objid = t.oid
+                      AND d.deptype = 'e'
+                  )",
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query custom types (ENUM/DOMAIN): {:?}", e))
+            })?;
 
         for row in type_rows {
             let schema: String = row.get(0);
             let name: String = row.get(1);
-            let def: String = row.get(2);
-            encoder
-                .write_record(&StreamRecord::PreData(PreDataRecord {
-                    name: format!("{}.{}", schema, name),
-                    sql: def,
-                }))
-                .await?;
+            if let Some(def) = row.get::<_, Option<String>>(2) {
+                encoder
+                    .write_record(&StreamRecord::PreData(PreDataRecord {
+                        name: format!("{}.{}", schema, name),
+                        sql: def,
+                    }))
+                    .await?;
+            }
         }
 
         // 3.6 Sequence Definitions
@@ -382,12 +417,14 @@ impl DatabaseAdapter for PostgresAdapter {
                  CASE WHEN cycle THEN ' CYCLE' ELSE ' NO CYCLE' END || \
                  ' CACHE ' || cache_size || ';' \
                  FROM pg_sequences \
-                 WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
+                 WHERE schemaname NOT LIKE 'pg_%' AND schemaname != 'information_schema' \
                  ORDER BY schemaname, sequencename",
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query sequence definitions: {}", e))
+            })?;
 
         for srow in seq_ddl_rows {
             let schema: String = srow.get(0);
@@ -519,12 +556,14 @@ impl DatabaseAdapter for PostgresAdapter {
                  FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE c.relkind = 'S' \
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                   AND n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema' \
                  ORDER BY n.nspname, c.relname",
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query sequence values: {}", e))
+            })?;
 
         for srow in seq_rows {
             let schema: String = srow.get(0);
@@ -552,49 +591,97 @@ impl DatabaseAdapter for PostgresAdapter {
                 .await?;
         }
 
-        // 6. Views & Materialized Views
+        // 6. Views & Materialized Views (topologically ordered by dependency)
         let view_rows = client
             .query(
-                "SELECT n.nspname, c.relname, pg_get_viewdef(c.oid), c.relkind
+                "SELECT c.oid::int8, n.nspname, c.relname, pg_get_viewdef(c.oid), c.relkind
                  FROM pg_class c
                  JOIN pg_namespace n ON n.oid = c.relnamespace
                  WHERE c.relkind IN ('v', 'm')
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                   AND n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema'
                  ORDER BY n.nspname, c.relname",
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!(
+                    "Failed to query views and materialized views: {}",
+                    e
+                ))
+            })?;
 
-        for vrow in view_rows {
-            let schema: String = vrow.get(0);
-            let view_name: String = vrow.get(1);
-            let view_def: String = vrow.get(2);
-            let relkind: i8 = vrow.get(3);
-            let sql = if relkind == b'm' as i8 {
+        let raw_views: Vec<ViewMeta> = view_rows
+            .into_iter()
+            .map(|vrow| {
+                let oid: i64 = vrow.get(0);
+                let schema: String = vrow.get(1);
+                let view_name: String = vrow.get(2);
+                let view_def: String = vrow.get(3);
+                let relkind: i8 = vrow.get(4);
+                ViewMeta {
+                    oid,
+                    schema,
+                    name: view_name,
+                    definition: view_def,
+                    is_materialized: relkind == b'm' as i8,
+                }
+            })
+            .collect();
+
+        let dep_rows = client
+            .query(
+                "SELECT DISTINCT
+                    r.ev_class::int8 AS view_oid,
+                    d.refobjid::int8 AS ref_view_oid
+                 FROM pg_depend d
+                 JOIN pg_rewrite r ON r.oid = d.objid
+                 JOIN pg_class c1 ON c1.oid = r.ev_class AND c1.relkind IN ('v', 'm')
+                 JOIN pg_class c2 ON c2.oid = d.refobjid AND c2.relkind IN ('v', 'm')
+                 WHERE d.classid = 'pg_rewrite'::regclass
+                   AND d.refclassid = 'pg_class'::regclass
+                   AND r.ev_class <> d.refobjid",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                DumperError::Database(format!(
+                    "Failed to query view dependencies from pg_depend: {}",
+                    e
+                ))
+            })?;
+
+        let deps: Vec<(i64, i64)> = dep_rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+
+        let ordered_views = sort_views_topologically(raw_views, &deps);
+
+        for view in ordered_views {
+            let sql = if view.is_materialized {
                 format!(
                     "CREATE MATERIALIZED VIEW {}.{} AS {}",
-                    quote_pg_identifier(&schema),
-                    quote_pg_identifier(&view_name),
-                    view_def
+                    quote_pg_identifier(&view.schema),
+                    quote_pg_identifier(&view.name),
+                    view.definition
                 )
             } else {
                 format!(
                     "CREATE OR REPLACE VIEW {}.{} AS {}",
-                    quote_pg_identifier(&schema),
-                    quote_pg_identifier(&view_name),
-                    view_def
+                    quote_pg_identifier(&view.schema),
+                    quote_pg_identifier(&view.name),
+                    view.definition
                 )
             };
-            let r_type = if relkind == b'm' as i8 {
+            let r_type = if view.is_materialized {
                 "MATERIALIZED_VIEW"
             } else {
                 "VIEW"
             };
             encoder
                 .write_record(&StreamRecord::Routine(RoutineRecord {
-                    schema_name: schema,
-                    name: view_name,
+                    schema_name: view.schema,
+                    name: view.name,
                     routine_type: r_type.into(),
                     sql,
                 }))
@@ -607,12 +694,19 @@ impl DatabaseAdapter for PostgresAdapter {
                 "SELECT n.nspname, p.proname, pg_get_functiondef(p.oid)
                  FROM pg_proc p
                  JOIN pg_namespace n ON n.oid = p.pronamespace
-                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-                   AND n.nspname NOT LIKE 'pg_temp_%'",
+                 WHERE p.prokind IN ('f', 'p')
+                   AND n.nspname NOT LIKE 'pg_%'
+                   AND n.nspname != 'information_schema'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM pg_depend d
+                     WHERE d.classid = 'pg_proc'::regclass
+                       AND d.objid = p.oid
+                       AND d.deptype = 'e'
+                   )",
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| DumperError::Database(format!("Failed to query functions: {}", e)))?;
 
         for row in func_rows {
             let schema: String = row.get(0);
@@ -646,7 +740,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!("Failed to query secondary indexes: {}", e))
+            })?;
 
         for irow in index_rows {
             let schema: String = irow.get(0);
@@ -677,7 +773,12 @@ impl DatabaseAdapter for PostgresAdapter {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                DumperError::Database(format!(
+                    "Failed to query constraints (PK/FK/UNIQUE/CHECK): {}",
+                    e
+                ))
+            })?;
 
         for row in constraint_rows {
             let schema: String = row.get(0);
@@ -705,11 +806,11 @@ impl DatabaseAdapter for PostgresAdapter {
                  JOIN pg_class c ON t.tgrelid = c.oid
                  JOIN pg_namespace n ON c.relnamespace = n.oid
                  WHERE NOT t.tgisinternal
-                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')",
+                   AND n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema'",
                 &[],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| DumperError::Database(format!("Failed to query triggers: {}", e)))?;
 
         for row in trigger_rows {
             let schema: String = row.get(0);
@@ -771,8 +872,31 @@ impl DatabaseAdapter for PostgresAdapter {
                     }
                 }
                 StreamRecord::PreData(p) => {
+                    let trimmed = p.sql.trim();
+                    if trimmed.to_ascii_uppercase().starts_with("CREATE SCHEMA")
+                        && (p.name.starts_with("pg_")
+                            || p.name.starts_with("\"pg_")
+                            || p.name.contains("pg_temp")
+                            || p.name.contains("pg_toast"))
+                    {
+                        eprintln!("Skipping restore of reserved system schema '{}'", p.name);
+                        continue;
+                    }
                     client.batch_execute(&p.sql).await.map_err(|e| {
-                        DumperError::Restore(format!("Failed to execute pre-data DDL: {}", e))
+                        let detail = if let Some(db_err) = e.as_db_error() {
+                            format!(
+                                "{}: {} (code: {:?})",
+                                db_err.message(),
+                                db_err.detail().unwrap_or(""),
+                                db_err.code()
+                            )
+                        } else {
+                            e.to_string()
+                        };
+                        DumperError::Restore(format!(
+                            "Failed to execute pre-data DDL for '{}' (SQL: '{}'): {}",
+                            p.name, p.sql, detail
+                        ))
                     })?;
                 }
                 StreamRecord::TableSchema(s) => {
@@ -956,6 +1080,95 @@ fn extract_sequence_from_default(default_expr: &str, default_schema: &str) -> Op
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewMeta {
+    pub oid: i64,
+    pub schema: String,
+    pub name: String,
+    pub definition: String,
+    pub is_materialized: bool,
+}
+
+/// Topologically sorts PostgreSQL views by dependency order using Kahn's algorithm.
+///
+/// `deps` contains pairs `(view_oid, ref_view_oid)` where `view_oid` depends on `ref_view_oid`.
+/// Referenced views are ordered before dependent views so they can be created sequentially
+/// during restore without `relation does not exist` errors.
+///
+/// Ties between views with equal dependency priority are resolved alphabetically by `(schema, name)`.
+/// If a cyclic dependency is detected, remaining views fall back to alphabetical ordering with a warning.
+pub fn sort_views_topologically(views: Vec<ViewMeta>, deps: &[(i64, i64)]) -> Vec<ViewMeta> {
+    if views.is_empty() {
+        return views;
+    }
+
+    let view_map: HashMap<i64, ViewMeta> = views.into_iter().map(|v| (v.oid, v)).collect();
+
+    let mut in_deps: HashMap<i64, HashSet<i64>> = HashMap::new();
+    let mut out_deps: HashMap<i64, Vec<i64>> = HashMap::new();
+
+    for &oid in view_map.keys() {
+        in_deps.entry(oid).or_default();
+        out_deps.entry(oid).or_default();
+    }
+
+    for &(view_oid, ref_view_oid) in deps {
+        if view_map.contains_key(&view_oid)
+            && view_map.contains_key(&ref_view_oid)
+            && view_oid != ref_view_oid
+        {
+            in_deps.entry(view_oid).or_default().insert(ref_view_oid);
+            out_deps.entry(ref_view_oid).or_default().push(view_oid);
+        }
+    }
+
+    // Ready set: views with 0 incoming dependencies.
+    // Stored as (schema, name, oid) in BTreeSet for deterministic alphabetical tie-breaking.
+    let mut ready: BTreeSet<(String, String, i64)> = BTreeSet::new();
+    for (&oid, dep_set) in &in_deps {
+        if dep_set.is_empty() {
+            let v = &view_map[&oid];
+            ready.insert((v.schema.clone(), v.name.clone(), oid));
+        }
+    }
+
+    let mut sorted = Vec::with_capacity(view_map.len());
+    let mut visited: HashSet<i64> = HashSet::new();
+
+    while let Some((_, _, oid)) = ready.pop_first() {
+        visited.insert(oid);
+        sorted.push(view_map[&oid].clone());
+
+        if let Some(dependents) = out_deps.get(&oid) {
+            for &dep_oid in dependents {
+                if let Some(pending) = in_deps.get_mut(&dep_oid) {
+                    pending.remove(&oid);
+                    if pending.is_empty() && !visited.contains(&dep_oid) {
+                        let dep_view = &view_map[&dep_oid];
+                        ready.insert((dep_view.schema.clone(), dep_view.name.clone(), dep_oid));
+                    }
+                }
+            }
+        }
+    }
+
+    // If there's a cycle or unvisited views, fall back to alphabetical for remaining
+    if sorted.len() < view_map.len() {
+        eprintln!(
+            "Warning: circular dependency detected among PostgreSQL views; falling back to alphabetical order for remaining views"
+        );
+        let mut remaining: Vec<_> = view_map
+            .values()
+            .filter(|v| !visited.contains(&v.oid))
+            .cloned()
+            .collect();
+        remaining.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+        sorted.extend(remaining);
+    }
+
+    sorted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,5 +1185,129 @@ mod tests {
         assert_eq!(quote_pg_literal("hello"), "'hello'");
         assert_eq!(quote_pg_literal("O'Reilly"), "'O''Reilly'");
         assert_eq!(quote_pg_literal(""), "''");
+    }
+
+    #[test]
+    fn test_topological_sort_views_empty() {
+        let sorted = sort_views_topologically(vec![], &[]);
+        assert!(sorted.is_empty());
+    }
+
+    #[test]
+    fn test_topological_sort_views_independent_sorted_alphabetically() {
+        let v1 = ViewMeta {
+            oid: 10,
+            schema: "public".into(),
+            name: "zeta_view".into(),
+            definition: "SELECT 1".into(),
+            is_materialized: false,
+        };
+        let v2 = ViewMeta {
+            oid: 20,
+            schema: "public".into(),
+            name: "alpha_view".into(),
+            definition: "SELECT 2".into(),
+            is_materialized: false,
+        };
+        let sorted = sort_views_topologically(vec![v1, v2], &[]);
+        assert_eq!(sorted[0].name, "alpha_view");
+        assert_eq!(sorted[1].name, "zeta_view");
+    }
+
+    #[test]
+    fn test_topological_sort_views_dependency_order() {
+        // alpha_view depends on zeta_view.
+        // Alphabetically, alpha_view would be first.
+        // But topologically, zeta_view must precede alpha_view.
+        let alpha = ViewMeta {
+            oid: 10,
+            schema: "public".into(),
+            name: "alpha_view".into(),
+            definition: "SELECT * FROM zeta_view".into(),
+            is_materialized: false,
+        };
+        let zeta = ViewMeta {
+            oid: 20,
+            schema: "public".into(),
+            name: "zeta_view".into(),
+            definition: "SELECT 1".into(),
+            is_materialized: false,
+        };
+        // Dependency: view 10 (alpha) depends on view 20 (zeta)
+        let deps = vec![(10, 20)];
+        let sorted = sort_views_topologically(vec![alpha, zeta], &deps);
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(sorted[0].name, "zeta_view");
+        assert_eq!(sorted[1].name, "alpha_view");
+    }
+
+    #[test]
+    fn test_topological_sort_views_diamond_dependency() {
+        let base = ViewMeta {
+            oid: 1,
+            schema: "public".into(),
+            name: "base".into(),
+            definition: "SELECT 1".into(),
+            is_materialized: false,
+        };
+        let mid_b = ViewMeta {
+            oid: 2,
+            schema: "public".into(),
+            name: "mid_b".into(),
+            definition: "SELECT * FROM base".into(),
+            is_materialized: false,
+        };
+        let mid_a = ViewMeta {
+            oid: 3,
+            schema: "public".into(),
+            name: "mid_a".into(),
+            definition: "SELECT * FROM base".into(),
+            is_materialized: false,
+        };
+        let top = ViewMeta {
+            oid: 4,
+            schema: "public".into(),
+            name: "top".into(),
+            definition: "SELECT * FROM mid_a, mid_b".into(),
+            is_materialized: false,
+        };
+
+        let deps = vec![
+            (2, 1), // mid_b depends on base
+            (3, 1), // mid_a depends on base
+            (4, 2), // top depends on mid_b
+            (4, 3), // top depends on mid_a
+        ];
+
+        let sorted = sort_views_topologically(vec![top, mid_b, base, mid_a], &deps);
+        assert_eq!(sorted.len(), 4);
+        assert_eq!(sorted[0].name, "base");
+        assert_eq!(sorted[1].name, "mid_a");
+        assert_eq!(sorted[2].name, "mid_b");
+        assert_eq!(sorted[3].name, "top");
+    }
+
+    #[test]
+    fn test_topological_sort_views_cycle_fallback() {
+        let v1 = ViewMeta {
+            oid: 1,
+            schema: "public".into(),
+            name: "view_b".into(),
+            definition: "SELECT 1".into(),
+            is_materialized: false,
+        };
+        let v2 = ViewMeta {
+            oid: 2,
+            schema: "public".into(),
+            name: "view_a".into(),
+            definition: "SELECT 1".into(),
+            is_materialized: false,
+        };
+        // Circular dependency
+        let deps = vec![(1, 2), (2, 1)];
+        let sorted = sort_views_topologically(vec![v1, v2], &deps);
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(sorted[0].name, "view_a");
+        assert_eq!(sorted[1].name, "view_b");
     }
 }
