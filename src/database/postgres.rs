@@ -883,12 +883,12 @@ impl DatabaseAdapter for PostgresAdapter {
                         continue;
                     }
                     client.batch_execute(&p.sql).await.map_err(|e| {
-                        let detail = if let Some(dbe) = e.as_db_error() {
+                        let detail = if let Some(db_err) = e.as_db_error() {
                             format!(
                                 "{}: {} (code: {:?})",
-                                dbe.message(),
-                                dbe.detail().unwrap_or(""),
-                                dbe.code()
+                                db_err.message(),
+                                db_err.detail().unwrap_or(""),
+                                db_err.code()
                             )
                         } else {
                             e.to_string()
