@@ -79,10 +79,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql mariadb-server curl openssl
-          # Download MinIO binary for local service test discovery
-          curl -sSL -o /tmp/minio https://dl.min.io/server/minio/release/linux-amd64/minio
-          chmod +x /tmp/minio
-          sudo mv /tmp/minio /usr/local/bin/minio
           # Add postgres utilities to PATH
           echo "/usr/lib/postgresql/16/bin" >> $GITHUB_PATH
 
@@ -147,12 +143,12 @@ jobs:
       - name: Start MinIO Server
         run: |
           mkdir -p /tmp/minio_data/test-bucket
-          curl -sSL -o /tmp/minio https://dl.min.io/server/minio/release/linux-amd64/minio
-          chmod +x /tmp/minio
-          sudo mv /tmp/minio /usr/local/bin/minio
-          export MINIO_ROOT_USER=minioadmin
-          export MINIO_ROOT_PASSWORD=minioadmin
-          minio server /tmp/minio_data --address 127.0.0.1:9000 &
+          chmod -R 777 /tmp/minio_data
+          docker run -d --name minio -p 9000:9000 \
+            -v /tmp/minio_data:/data \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            cgr.dev/chainguard/minio:latest server /data
           for i in {1..30}; do
             if curl -s -f http://127.0.0.1:9000/minio/health/live; then
               echo "MinIO is ready"
