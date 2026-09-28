@@ -107,6 +107,7 @@ async fn run(cli: Cli, reporter: &ProgressReporter) -> Result<(), DumperError> {
             access_key,
             secret_key,
             cli.session_token.clone(),
+            cli.s3_ca_cert.as_deref(),
         )?);
         execute_command_with_backend(s3_backend, &cli.command, &cli, repo_url, reporter).await
     } else {
@@ -132,13 +133,8 @@ async fn execute_command_with_backend<B: StorageBackend + 'static>(
             ));
             Ok(())
         }
-        Commands::Unlock(args) => {
-            let removed = RepositoryLock::unlock_all(&*backend, args.force).await?;
-            reporter.log_info(&format!("Removed {} lock(s)", removed));
-            Ok(())
-        }
         _ => {
-            // All other commands require opening and unlocking repository with password
+            // All commands (including unlock) require opening and unlocking repository with password (SEC-02)
             let password = resolve_password(cli, false)?;
             let engine = RepositoryEngine::open(backend.clone(), &password).await?;
             dispatch_engine_command(backend, engine, command, cli, reporter).await
@@ -411,6 +407,7 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
             let options = RestoreOptions {
                 target_database_override: args.database.clone(),
                 drop_existing: args.drop_existing,
+                single_transaction: args.single_transaction,
             };
 
             let stats = db_adapter.restore(&mut decoder, &options).await?;
@@ -571,36 +568,51 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
             Ok(())
         }
 
+        Commands::Unlock(args) => {
+            let removed = RepositoryLock::unlock_all(&*backend, args.force).await?;
+            reporter.log_info(&format!("Removed {} lock(s)", removed));
+            Ok(())
+        }
+
         _ => Ok(()),
     }
 }
 
-fn resolve_password(cli: &Cli, is_init: bool) -> Result<String, DumperError> {
+fn resolve_password(cli: &Cli, is_init: bool) -> Result<zeroize::Zeroizing<String>, DumperError> {
+    use zeroize::Zeroize;
+
     if let Some(ref pass) = cli.password {
-        return Ok(pass.clone());
+        return Ok(zeroize::Zeroizing::new(pass.clone()));
     }
-    if let Ok(pass) = std::env::var("DUMPER_PASSWORD") {
+    if let Ok(mut pass) = std::env::var("DUMPER_PASSWORD") {
         if !pass.is_empty() {
-            return Ok(pass);
+            std::env::remove_var("DUMPER_PASSWORD");
+            let res = zeroize::Zeroizing::new(pass.clone());
+            pass.zeroize();
+            return Ok(res);
         }
     }
     if let Some(ref file_path) = cli.password_file {
-        let content = std::fs::read_to_string(file_path).map_err(|e| {
+        let mut content = std::fs::read_to_string(file_path).map_err(|e| {
             DumperError::Config(format!(
                 "Failed to read password file '{}': {}",
                 file_path, e
             ))
         })?;
-        return Ok(content.trim().to_string());
+        let res = zeroize::Zeroizing::new(content.trim().to_string());
+        content.zeroize();
+        return Ok(res);
     }
     if let Ok(file_path) = std::env::var("DUMPER_PASSWORD_FILE") {
-        let content = std::fs::read_to_string(&file_path).map_err(|e| {
+        let mut content = std::fs::read_to_string(&file_path).map_err(|e| {
             DumperError::Config(format!(
                 "Failed to read password file '{}': {}",
                 file_path, e
             ))
         })?;
-        return Ok(content.trim().to_string());
+        let res = zeroize::Zeroizing::new(content.trim().to_string());
+        content.zeroize();
+        return Ok(res);
     }
 
     // Interactive prompt without terminal echo
@@ -610,15 +622,16 @@ fn resolve_password(cli: &Cli, is_init: bool) -> Result<String, DumperError> {
         "Enter repository password: "
     };
 
-    let pass = rpassword::prompt_password(prompt).map_err(|e| {
+    let mut pass = rpassword::prompt_password(prompt).map_err(|e| {
         DumperError::Authentication(format!("Failed to read password from stdin: {}", e))
     })?;
 
     let trimmed = pass.trim().to_string();
+    pass.zeroize();
     if trimmed.is_empty() {
         return Err(DumperError::Authentication(
             "Password cannot be empty".into(),
         ));
     }
-    Ok(trimmed)
+    Ok(zeroize::Zeroizing::new(trimmed))
 }

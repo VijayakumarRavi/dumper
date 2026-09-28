@@ -108,12 +108,12 @@ impl<'a> SigV4Signer<'a> {
         (amz_date, payload_hash, authorization)
     }
 
-    fn get_signature_key(&self, date_stamp: &str) -> Vec<u8> {
-        let k_secret = format!("AWS4{}", self.secret_key);
-        let k_date = hmac_sha256(k_secret.as_bytes(), date_stamp.as_bytes());
-        let k_region = hmac_sha256(&k_date, self.region.as_bytes());
-        let k_service = hmac_sha256(&k_region, self.service.as_bytes());
-        hmac_sha256(&k_service, b"aws4_request")
+    fn get_signature_key(&self, date_stamp: &str) -> zeroize::Zeroizing<Vec<u8>> {
+        let k_secret = zeroize::Zeroizing::new(format!("AWS4{}", self.secret_key).into_bytes());
+        let k_date = zeroize::Zeroizing::new(hmac_sha256(&k_secret, date_stamp.as_bytes()));
+        let k_region = zeroize::Zeroizing::new(hmac_sha256(&k_date, self.region.as_bytes()));
+        let k_service = zeroize::Zeroizing::new(hmac_sha256(&k_region, self.service.as_bytes()));
+        zeroize::Zeroizing::new(hmac_sha256(&k_service, b"aws4_request"))
     }
 }
 

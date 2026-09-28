@@ -271,6 +271,7 @@ async fn test_postgres_restore_propagates_postdata_error() {
     let options = RestoreOptions {
         target_database_override: None,
         drop_existing: true,
+        single_transaction: false,
     };
 
     let res = adapter.restore(&mut decoder, &options).await;
@@ -385,6 +386,7 @@ async fn test_postgres_custom_types_and_precision_preserved() {
     let options = RestoreOptions {
         target_database_override: None,
         drop_existing: true,
+        single_transaction: false,
     };
     let restore_stats = adapter.restore(&mut decoder, &options).await.unwrap();
     assert_eq!(restore_stats.tables_restored, 1);
@@ -478,6 +480,7 @@ async fn test_postgres_sequence_and_serial_restoration_roundtrip() {
     let options = RestoreOptions {
         target_database_override: None,
         drop_existing: true,
+        single_transaction: false,
     };
     let restore_stats = adapter.restore(&mut decoder, &options).await.unwrap();
     assert_eq!(restore_stats.tables_restored, 1);
@@ -582,6 +585,7 @@ async fn test_postgres_restore_target_database_override() {
     let options = RestoreOptions {
         target_database_override: Some("staging_db".into()),
         drop_existing: true,
+        single_transaction: false,
     };
 
     let stats = adapter.restore(&mut decoder, &options).await.unwrap();
@@ -798,6 +802,7 @@ async fn test_postgres_tls_success_roundtrip() {
         let restore_opts = RestoreOptions {
             target_database_override: None,
             drop_existing: false,
+            single_transaction: false,
         };
         let restore_stats = target_adapter
             .restore(&mut decoder, &restore_opts)
@@ -930,6 +935,7 @@ async fn test_postgres_concurrent_write_consistency() {
             &RestoreOptions {
                 target_database_override: None,
                 drop_existing: false,
+                single_transaction: false,
             },
         )
         .await
@@ -1016,6 +1022,7 @@ async fn test_postgres_view_dependency_order_restoration() {
             &RestoreOptions {
                 target_database_override: None,
                 drop_existing: false,
+                single_transaction: false,
             },
         )
         .await
@@ -1129,6 +1136,7 @@ async fn test_postgres_libpq_key_value_backup_restore_roundtrip() {
     let r_options = RestoreOptions {
         target_database_override: None,
         drop_existing: true,
+        single_transaction: false,
     };
     let r_stats = dest_adapter
         .restore(&mut decoder, &r_options)
@@ -1206,6 +1214,7 @@ async fn test_postgres_extension_and_reserved_schema_roundtrip() {
     let r_options = RestoreOptions {
         target_database_override: None,
         drop_existing: true,
+        single_transaction: false,
     };
     let r_stats = dest_adapter
         .restore(&mut decoder, &r_options)
@@ -1230,4 +1239,100 @@ async fn test_postgres_extension_and_reserved_schema_roundtrip() {
         .unwrap();
     let email: String = row.get(0);
     assert_eq!(email, "User@Example.Com");
+}
+
+#[tokio::test]
+async fn test_postgres_restore_single_transaction_rollback_on_failure() {
+    let _guard = PG_TEST_MUTEX.lock().await;
+
+    let pg = match TestPgServer::start() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping test: postgresql not available in test environment");
+            return;
+        }
+    };
+
+    assert!(pg.createdb("single_tx_db"));
+    let target_url = format!("postgres://postgres@127.0.0.1:{}/single_tx_db", pg.port);
+    let adapter = PostgresAdapter::new(&target_url);
+
+    // Build a backup stream containing a valid table, some rows, followed by an invalid post-data command
+    let mut buffer = Vec::new();
+    {
+        let mut encoder = StreamEncoder::new(&mut buffer);
+        let header = StreamHeader {
+            version: 1,
+            engine: "postgresql".into(),
+            database: "single_tx_db".into(),
+            server_version: "16".into(),
+            dumper_version: "0.2.0".into(),
+            start_time: 1700000000,
+        };
+        encoder
+            .write_record(&StreamRecord::Header(header))
+            .await
+            .unwrap();
+
+        let schema = TableSchemaRecord {
+            schema_name: "public".into(),
+            table_name: "tx_rollback_test".into(),
+            columns: vec![TableColumnMeta {
+                name: "id".into(),
+                data_type: "integer".into(),
+                is_nullable: false,
+                default_val: None,
+            }],
+            create_sql: "CREATE TABLE public.tx_rollback_test (id integer NOT NULL);".into(),
+        };
+        encoder
+            .write_record(&StreamRecord::TableSchema(schema))
+            .await
+            .unwrap();
+
+        // Write intentional invalid SQL in PostData to cause restore failure
+        let invalid_post = PostDataRecord {
+            schema_name: "public".into(),
+            table_name: "tx_rollback_test".into(),
+            name: "failing_constraint".into(),
+            sql: "ALTER TABLE public.tx_rollback_test ADD CONSTRAINT broken_chk CHECK (SYNTAX ERROR);".into(),
+        };
+        encoder
+            .write_record(&StreamRecord::PostData(invalid_post))
+            .await
+            .unwrap();
+
+        encoder.finish().await.unwrap();
+    }
+
+    // 1. Restore with single_transaction: true -> MUST fail and ROLLBACK
+    let mut decoder = StreamDecoder::new(buffer.as_slice());
+    let opts = RestoreOptions {
+        target_database_override: None,
+        drop_existing: true,
+        single_transaction: true,
+    };
+    let res = adapter.restore(&mut decoder, &opts).await;
+    assert!(
+        res.is_err(),
+        "Restore must fail due to syntax error in post-data"
+    );
+
+    // Verify tx_rollback_test table does NOT exist because transaction rolled back!
+    let (client, conn) = tokio_postgres::connect(&target_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let check_row = client
+        .query_opt("SELECT to_regclass('public.tx_rollback_test')::text;", &[])
+        .await
+        .unwrap();
+    let regclass: Option<String> = check_row.and_then(|r| r.get(0));
+    assert!(
+        regclass.is_none(),
+        "Table must NOT exist because single_transaction rolled back the entire restore!"
+    );
 }

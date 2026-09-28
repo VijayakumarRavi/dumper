@@ -178,6 +178,7 @@ async fn test_mysql_restore_propagates_insert_error() {
     let options = RestoreOptions {
         target_database_override: None,
         drop_existing: true,
+        single_transaction: false,
     };
 
     let res = adapter.restore(&mut decoder, &options).await;
@@ -300,6 +301,7 @@ async fn test_mysql_restore_batch_inserts_and_escaping_roundtrip() {
     let options = RestoreOptions {
         target_database_override: None,
         drop_existing: true,
+        single_transaction: false,
     };
 
     let stats = adapter.restore(&mut decoder, &options).await.unwrap();
@@ -412,6 +414,7 @@ async fn test_mysql_restore_transaction_rollback_on_failure() {
     let options = RestoreOptions {
         target_database_override: None,
         drop_existing: true,
+        single_transaction: false,
     };
 
     let res = adapter.restore(&mut decoder, &options).await;
@@ -486,6 +489,7 @@ async fn test_mysql_binary_and_text_columns_roundtrip() {
     let options = RestoreOptions {
         target_database_override: None,
         drop_existing: true,
+        single_transaction: false,
     };
     let restore_stats = adapter
         .restore(&mut decoder, &options)

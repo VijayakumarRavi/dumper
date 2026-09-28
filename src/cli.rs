@@ -67,6 +67,13 @@ pub struct Cli {
     pub session_token: Option<String>,
 
     #[arg(
+        long = "s3-ca-cert",
+        env = "DUMPER_S3_CA_CERT",
+        help = "Path to custom Root CA certificate PEM file for S3 TLS verification"
+    )]
+    pub s3_ca_cert: Option<String>,
+
+    #[arg(
         short = 'q',
         long = "quiet",
         help = "Quiet mode (suppress progress output)"
@@ -183,6 +190,12 @@ pub struct RestoreArgs {
 
     #[arg(long = "drop-existing", help = "Drop tables before restoring them")]
     pub drop_existing: bool,
+
+    #[arg(
+        long = "single-transaction",
+        help = "Execute entire PostgreSQL restore inside a single transaction (aborts and rolls back on failure)"
+    )]
+    pub single_transaction: bool,
 }
 
 #[derive(Args, Debug)]

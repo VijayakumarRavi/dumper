@@ -89,21 +89,20 @@ impl<B: StorageBackend> RepositoryEngine<B> {
         // 1. Compress
         let (comp_tag, compressed) = compress_data(compression, raw_data)?;
 
-        // 2. Encrypt
-        let encrypted = encrypt_blob(&self.master_key, &compressed)?;
+        // 2. Encrypt: SEC-05: Put compression tag inside authenticated plaintext envelope
+        let mut payload_to_encrypt = Vec::with_capacity(1 + compressed.len());
+        payload_to_encrypt.push(comp_tag);
+        payload_to_encrypt.extend_from_slice(&compressed);
 
-        // Prepend 1-byte compression tag to stored payload: [compression_tag (1B) | encrypted_data]
-        let mut stored_payload = Vec::with_capacity(1 + encrypted.len());
-        stored_payload.push(comp_tag);
-        stored_payload.extend_from_slice(&encrypted);
+        let encrypted = encrypt_blob(&self.master_key, &payload_to_encrypt)?;
 
         // 3. Upload
-        self.backend.put_object(&blob_path, &stored_payload).await?;
+        self.backend.put_object(&blob_path, &encrypted).await?;
 
         let blob_ref = BlobReference {
             hash: hash_hex.to_string(),
             raw_size: raw_data.len() as u64,
-            stored_size: stored_payload.len() as u64,
+            stored_size: encrypted.len() as u64,
             compression_tag: comp_tag,
         };
 
@@ -122,11 +121,31 @@ impl<B: StorageBackend> RepositoryEngine<B> {
             )));
         }
 
-        let comp_tag = stored_payload[0];
-        let encrypted = &stored_payload[1..];
-
-        // Decrypt
-        let compressed = decrypt_blob(&self.master_key, encrypted)?;
+        // Decrypt: SEC-05: Authenticate before decompressing
+        let (comp_tag, compressed) = match decrypt_blob(&self.master_key, &stored_payload) {
+            Ok(decrypted) => {
+                if decrypted.is_empty() {
+                    return Err(DumperError::Integrity(
+                        "Decrypted chunk payload is empty".into(),
+                    ));
+                }
+                (decrypted[0], decrypted[1..].to_vec())
+            }
+            Err(e) => {
+                // Backward compatibility for legacy format: [comp_tag (1B) | encrypted_data]
+                if stored_payload.len() > 1 {
+                    let legacy_tag = stored_payload[0];
+                    let legacy_encrypted = &stored_payload[1..];
+                    if let Ok(decrypted) = decrypt_blob(&self.master_key, legacy_encrypted) {
+                        (legacy_tag, decrypted)
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
 
         // Decompress
         let raw_data = decompress_data(comp_tag, &compressed)?;
@@ -143,7 +162,19 @@ impl<B: StorageBackend> RepositoryEngine<B> {
         Ok(raw_data)
     }
 
-    /// Commit a snapshot atomically
+    /// Helper to decode snapshot metadata, supporting both authenticated encrypted format
+    /// (SEC-01) and legacy plaintext JSON for backward compatibility.
+    fn decode_snapshot_data(&self, data: &[u8]) -> Result<SnapshotMetadata, DumperError> {
+        let json_bytes = if !data.is_empty() && data[0] == b'{' {
+            data.to_vec()
+        } else {
+            decrypt_blob(&self.master_key, data)?
+        };
+        serde_json::from_slice::<SnapshotMetadata>(&json_bytes)
+            .map_err(|e| DumperError::Format(format!("Failed to parse snapshot metadata: {}", e)))
+    }
+
+    /// Commit a snapshot atomically with encryption under repository master key (SEC-01)
     pub async fn commit_snapshot(&self, snapshot: &SnapshotMetadata) -> Result<(), DumperError> {
         let path = SnapshotMetadata::snapshot_path(&snapshot.id);
         if self.backend.object_exists(&path).await? {
@@ -152,8 +183,9 @@ impl<B: StorageBackend> RepositoryEngine<B> {
                 snapshot.id
             )));
         }
-        let data = serde_json::to_vec_pretty(snapshot)?;
-        self.backend.put_object(&path, &data).await
+        let json_bytes = serde_json::to_vec(snapshot)?;
+        let encrypted = encrypt_blob(&self.master_key, &json_bytes)?;
+        self.backend.put_object(&path, &encrypted).await
     }
 
     /// List all committed snapshots, sorted newest first
@@ -165,7 +197,7 @@ impl<B: StorageBackend> RepositoryEngine<B> {
             let data = self.backend.get_object(&key).await.map_err(|e| {
                 DumperError::Repository(format!("Failed to read snapshot '{}': {}", key, e))
             })?;
-            let snapshot = serde_json::from_slice::<SnapshotMetadata>(&data).map_err(|e| {
+            let snapshot = self.decode_snapshot_data(&data).map_err(|e| {
                 DumperError::Format(format!(
                     "Failed to parse snapshot metadata in '{}': {}",
                     key, e
@@ -178,12 +210,46 @@ impl<B: StorageBackend> RepositoryEngine<B> {
         Ok(snapshots)
     }
 
-    /// Find snapshot by short (prefix) or full ID
+    /// Find snapshot by short (prefix) or full ID.
+    ///
+    /// Attempts direct lookup by snapshot path first, then falls back to searching
+    /// known snapshot files. Unparseable/corrupted snapshot files during search do not
+    /// prevent finding a valid snapshot (SEC-07).
     pub async fn find_snapshot(&self, id_query: &str) -> Result<SnapshotMetadata, DumperError> {
-        let snapshots = self.list_snapshots().await?;
-        for s in snapshots {
-            if s.id == id_query || s.full_id == id_query || s.full_id.starts_with(id_query) {
-                return Ok(s);
+        // 1. Direct path lookup: if id_query is an exact snapshot ID
+        let direct_path = SnapshotMetadata::snapshot_path(id_query);
+        if self
+            .backend
+            .object_exists(&direct_path)
+            .await
+            .unwrap_or(false)
+        {
+            let data = self.backend.get_object(&direct_path).await?;
+            let snapshot = self.decode_snapshot_data(&data).map_err(|e| {
+                DumperError::Format(format!(
+                    "Failed to parse snapshot metadata in '{}': {}",
+                    direct_path, e
+                ))
+            })?;
+            if snapshot.id == id_query
+                || snapshot.full_id == id_query
+                || snapshot.full_id.starts_with(id_query)
+            {
+                return Ok(snapshot);
+            }
+        }
+
+        // 2. Search all snapshot keys by prefix or full ID, ignoring corrupt files so they
+        // don't cause a Denial of Service for valid restores.
+        let keys = self.backend.list_objects("snapshots").await?;
+        for key in keys {
+            if let Ok(data) = self.backend.get_object(&key).await {
+                if let Ok(s) = self.decode_snapshot_data(&data) {
+                    if s.id == id_query || s.full_id == id_query || s.full_id.starts_with(id_query)
+                    {
+                        return Ok(s);
+                    }
+                }
             }
         }
         Err(DumperError::Repository(format!(
@@ -340,6 +406,24 @@ mod tests {
 
         // Duplicate snapshot ID must be rejected to prevent overwrites
         assert!(engine.commit_snapshot(&snapshot).await.is_err());
+
+        // SEC-01: Verify that raw stored snapshot bytes on disk are encrypted (not plain JSON)
+        let raw_snap_bytes = backend.get_object("snapshots/12345678").await.unwrap();
+        assert!(!raw_snap_bytes.starts_with(b"{"));
+        assert!(serde_json::from_slice::<SnapshotMetadata>(&raw_snap_bytes).is_err());
+
+        // SEC-05: Tampering with stored blob triggers AEAD authentication failure before decompression
+        let blob_path = SnapshotMetadata::blob_path(&hash1);
+        let mut tampered_blob = backend.get_object(&blob_path).await.unwrap();
+        tampered_blob[0] ^= 0xFF; // flip byte
+        let tampered_hash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let tampered_path = SnapshotMetadata::blob_path(tampered_hash);
+        backend
+            .put_object(&tampered_path, &tampered_blob)
+            .await
+            .unwrap();
+        assert!(engine.get_chunk(tampered_hash).await.is_err());
+        backend.delete_object(&tampered_path).await.unwrap();
 
         // 6. List snapshots
         let list = engine.list_snapshots().await.unwrap();

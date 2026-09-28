@@ -182,6 +182,13 @@ async fn test_prune_safety_on_corrupt_or_unreadable_snapshot() {
         .await
         .unwrap();
 
+    // SEC-07: finding and restoring valid snapshot MUST succeed even if a corrupted snapshot exists!
+    let found_direct = engine.find_snapshot("snap_valid").await.unwrap();
+    assert_eq!(found_direct.id, "snap_valid");
+
+    let found_by_full_id = engine.find_snapshot("snap_valid_full").await.unwrap();
+    assert_eq!(found_by_full_id.id, "snap_valid");
+
     // prune() MUST abort with an error and must NOT delete any blobs!
     let prune_res = engine.prune().await;
     assert!(
@@ -355,23 +362,30 @@ async fn test_abandoned_temp_files_cleanup_and_detection() {
 
     let fake_tmp1 = blobs_dir.join(".tmp_99999998_2222");
     let fake_tmp2 = snaps_dir.join(".tmp_99999999_4444");
+    // SEC-10: In-flight temp file from another host on a shared volume
+    let remote_tmp = blobs_dir.join(".tmp_worker-node-2_1234_5555");
+
     tokio::fs::write(&fake_tmp1, b"abandoned partial blob data")
         .await
         .unwrap();
     tokio::fs::write(&fake_tmp2, b"abandoned partial snapshot data")
         .await
         .unwrap();
+    tokio::fs::write(&remote_tmp, b"remote active in-flight blob")
+        .await
+        .unwrap();
 
-    // 2. Detection: backend count_temp_files must find both
-    assert_eq!(backend.count_temp_files().await.unwrap(), 2);
+    // 2. Detection: backend count_temp_files must find all 3
+    assert_eq!(backend.count_temp_files().await.unwrap(), 3);
 
-    // 3. Prune: pruning the repository must clean up abandoned temporary files
+    // 3. Prune: pruning the repository must clean up abandoned temporary files but preserve remote in-flight files
     let (_deleted_blobs, _freed) = engine.prune().await.unwrap();
 
-    // 4. Verify that temp files are now gone
-    assert_eq!(backend.count_temp_files().await.unwrap(), 0);
+    // 4. Verify that local abandoned temp files are gone, but remote in-flight temp file is preserved
+    assert_eq!(backend.count_temp_files().await.unwrap(), 1);
     assert!(!fake_tmp1.exists());
     assert!(!fake_tmp2.exists());
+    assert!(remote_tmp.exists());
 }
 
 #[tokio::test]

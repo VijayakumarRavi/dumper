@@ -40,8 +40,10 @@ impl KeyEnvelope {
             return Err(DumperError::Format("Stored salt has invalid length".into()));
         }
 
-        let encrypted_master = hex::decode(&self.encrypted_master_key_hex)
-            .map_err(|e| DumperError::Format(format!("Invalid encrypted master key hex: {}", e)))?;
+        let encrypted_master =
+            Zeroizing::new(hex::decode(&self.encrypted_master_key_hex).map_err(|e| {
+                DumperError::Format(format!("Invalid encrypted master key hex: {}", e))
+            })?);
 
         let kek = derive_key(password, &salt)?;
         let decrypted = Zeroizing::new(decrypt_blob(&kek, &encrypted_master).map_err(|_| {

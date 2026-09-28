@@ -1,7 +1,7 @@
 use crate::error::DumperError;
 use crate::repository::backend::StorageBackend;
 use std::path::{Path, PathBuf};
-use tokio::fs::{self, File};
+use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 pub struct LocalBackend {
@@ -14,12 +14,22 @@ impl LocalBackend {
         fs::create_dir_all(&base_path).await.map_err(|e| {
             DumperError::Repository(format!("Failed to create repository directory: {}", e))
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&base_path, std::fs::Permissions::from_mode(0o700));
+        }
         let canonical = fs::canonicalize(&base_path).await.map_err(|e| {
             DumperError::Repository(format!(
                 "Failed to canonicalize repository directory: {}",
                 e
             ))
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o700));
+        }
         Ok(Self {
             base_path: canonical,
         })
@@ -76,6 +86,67 @@ fn is_pid_alive(_pid: u32) -> bool {
     false
 }
 
+fn get_host_id() -> String {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        let sanitized = sanitize_hostname(&h);
+        if !sanitized.is_empty() {
+            return sanitized;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        unsafe {
+            if libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0 {
+                if let Ok(s) =
+                    std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char).to_str()
+                {
+                    let sanitized = sanitize_hostname(s);
+                    if !sanitized.is_empty() {
+                        return sanitized;
+                    }
+                }
+            }
+        }
+    }
+    "host".to_string()
+}
+
+fn sanitize_hostname(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn secure_dir_tree(path: &Path, base_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut curr = path;
+        while curr.starts_with(base_path) {
+            if let Ok(meta) = std::fs::metadata(curr) {
+                if meta.is_dir() {
+                    let _ = std::fs::set_permissions(curr, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+            if curr == base_path {
+                break;
+            }
+            if let Some(parent) = curr.parent() {
+                curr = parent;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 impl StorageBackend for LocalBackend {
     async fn put_object(&self, path: &str, data: &[u8]) -> Result<(), DumperError> {
         let target_path = self.resolve_path(path)?;
@@ -83,17 +154,31 @@ impl StorageBackend for LocalBackend {
             fs::create_dir_all(parent).await.map_err(|e| {
                 DumperError::Repository(format!("Failed to create parent directory: {}", e))
             })?;
+            secure_dir_tree(parent, &self.base_path);
         }
 
         // Atomic write: write to a temporary file in the same directory, sync, then rename
-        let tmp_filename = format!(".tmp_{}_{}", std::process::id(), rand::random::<u64>());
+        // SEC-10: Include sanitized host identifier so processes on shared filesystems (NFS/PVC)
+        // do not clean up each other's in-flight temporary files.
+        let tmp_filename = format!(
+            ".tmp_{}_{}_{}",
+            get_host_id(),
+            std::process::id(),
+            rand::random::<u64>()
+        );
         let tmp_path = target_path
             .parent()
             .unwrap_or(&self.base_path)
             .join(&tmp_filename);
 
         let write_res = async {
-            let mut file = File::create(&tmp_path).await.map_err(|e| {
+            #[allow(unused_mut)]
+            let mut open_options = tokio::fs::OpenOptions::new();
+            open_options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            open_options.mode(0o600);
+
+            let mut file = open_options.open(&tmp_path).await.map_err(|e| {
                 DumperError::Repository(format!("Failed to create temp file {:?}: {}", tmp_path, e))
             })?;
 
@@ -123,6 +208,13 @@ impl StorageBackend for LocalBackend {
                         tmp_path, target_path, rename_err
                     )));
                 }
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o600));
             }
 
             Ok::<(), DumperError>(())
@@ -279,7 +371,25 @@ impl StorageBackend for LocalBackend {
                                 if elapsed.as_secs() < 3600 {
                                     let parts: Vec<&str> =
                                         fname.trim_start_matches(".tmp_").split('_').collect();
-                                    if let Some(pid_str) = parts.first() {
+                                    if parts.len() >= 3 {
+                                        // Format: .tmp_{host}_{pid}_{rand}
+                                        let file_host = parts[0];
+                                        let pid_str = parts[1];
+                                        let current_host = get_host_id();
+
+                                        if file_host == current_host {
+                                            if let Ok(pid) = pid_str.parse::<u32>() {
+                                                if pid == std::process::id() || is_pid_alive(pid) {
+                                                    in_flight = true;
+                                                }
+                                            }
+                                        } else {
+                                            // Remote host on shared filesystem: cannot check PID locally,
+                                            // so treat recent files (< 3600s) as in-flight
+                                            in_flight = true;
+                                        }
+                                    } else if let Some(pid_str) = parts.first() {
+                                        // Legacy format: .tmp_{pid}_{rand}
                                         if let Ok(pid) = pid_str.parse::<u32>() {
                                             if pid == std::process::id() || is_pid_alive(pid) {
                                                 in_flight = true;
@@ -411,5 +521,68 @@ mod tests {
         assert_eq!(cleaned, 1);
         assert!(in_flight.exists());
         assert!(!abandoned.exists());
+    }
+
+    #[tokio::test]
+    async fn test_multi_host_temp_file_race_condition() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+
+        let current_host = get_host_id();
+        let remote_host = format!("{}-remote-node", current_host);
+
+        let sub_dir = temp_dir.path().join("blobs/cd");
+        fs::create_dir_all(&sub_dir).await.unwrap();
+
+        // 1. In-flight file from local host: active pid
+        let local_active =
+            sub_dir.join(format!(".tmp_{}_{}_1001", current_host, std::process::id()));
+        // 2. Abandoned file from local host: dead pid (99999999)
+        let local_dead = sub_dir.join(format!(".tmp_{}_99999999_1002", current_host));
+        // 3. In-flight file from remote host: recent timestamp
+        let remote_active = sub_dir.join(format!(".tmp_{}_99999999_1003", remote_host));
+
+        fs::write(&local_active, b"local active").await.unwrap();
+        fs::write(&local_dead, b"local dead").await.unwrap();
+        fs::write(&remote_active, b"remote active").await.unwrap();
+
+        assert_eq!(backend.count_temp_files().await.unwrap(), 3);
+
+        // cleanup_temp_files should ONLY clean up local_dead!
+        // local_active is active on this host, and remote_active is < 3600s so it cannot be touched.
+        let cleaned = backend.cleanup_temp_files().await.unwrap();
+        assert_eq!(cleaned, 1);
+        assert!(local_active.exists());
+        assert!(!local_dead.exists());
+        assert!(remote_active.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_local_backend_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let backend = LocalBackend::new(&repo_dir).await.unwrap();
+
+        // 1. Verify repo directory is 0700 (rwx------)
+        let meta = std::fs::metadata(&repo_dir).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+
+        // 2. Put an object into nested directories
+        backend
+            .put_object("blobs/ab/test_chunk", b"classified")
+            .await
+            .unwrap();
+
+        // 3. Verify subdirectories are 0700 (rwx------)
+        let sub_dir = repo_dir.join("blobs").join("ab");
+        let sub_meta = std::fs::metadata(&sub_dir).unwrap();
+        assert_eq!(sub_meta.permissions().mode() & 0o777, 0o700);
+
+        // 4. Verify created file is 0600 (rw-------)
+        let file_path = sub_dir.join("test_chunk");
+        let file_meta = std::fs::metadata(&file_path).unwrap();
+        assert_eq!(file_meta.permissions().mode() & 0o777, 0o600);
     }
 }

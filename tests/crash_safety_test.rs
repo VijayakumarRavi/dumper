@@ -137,6 +137,7 @@ async fn test_sigkill_during_s3_upload_crash_resilience() {
             "minioadmin".into(),
             "minioadmin".into(),
             None,
+            None,
         )
         .unwrap(),
     );

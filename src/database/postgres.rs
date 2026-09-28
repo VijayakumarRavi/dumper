@@ -73,11 +73,199 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-fn create_rustls_connector(verify: bool) -> MakeRustlsConnect {
+fn decode_base64_der(input: &str) -> Result<Vec<u8>, DumperError> {
+    fn decode_char(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|&b| !b.is_ascii_whitespace())
+        .collect();
+    if clean.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !clean.len().is_multiple_of(4) {
+        return Err(DumperError::Database(
+            "Invalid base64 length in certificate".into(),
+        ));
+    }
+    let mut out = Vec::with_capacity((clean.len() * 3) / 4);
+    for chunk in clean.chunks_exact(4) {
+        let b0 = decode_char(chunk[0])
+            .ok_or_else(|| DumperError::Database("Invalid base64 character".into()))?;
+        let b1 = decode_char(chunk[1])
+            .ok_or_else(|| DumperError::Database("Invalid base64 character".into()))?;
+        if chunk[2] == b'=' {
+            if chunk[3] != b'=' {
+                return Err(DumperError::Database("Invalid base64 padding".into()));
+            }
+            out.push((b0 << 2) | (b1 >> 4));
+        } else if chunk[3] == b'=' {
+            let b2 = decode_char(chunk[2])
+                .ok_or_else(|| DumperError::Database("Invalid base64 character".into()))?;
+            out.push((b0 << 2) | (b1 >> 4));
+            out.push((b1 << 4) | (b2 >> 2));
+        } else {
+            let b2 = decode_char(chunk[2])
+                .ok_or_else(|| DumperError::Database("Invalid base64 character".into()))?;
+            let b3 = decode_char(chunk[3])
+                .ok_or_else(|| DumperError::Database("Invalid base64 character".into()))?;
+            out.push((b0 << 2) | (b1 >> 4));
+            out.push((b1 << 4) | (b2 >> 2));
+            out.push((b2 << 6) | b3);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_pem_certificates(
+    pem_data: &str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, DumperError> {
+    let mut certs = Vec::new();
+    let mut in_cert = false;
+    let mut current_base64 = String::new();
+
+    for line in pem_data.lines() {
+        let line = line.trim();
+        if line == "-----BEGIN CERTIFICATE-----" {
+            in_cert = true;
+            current_base64.clear();
+        } else if line == "-----END CERTIFICATE-----" {
+            if in_cert {
+                in_cert = false;
+                let der = decode_base64_der(&current_base64)?;
+                certs.push(rustls::pki_types::CertificateDer::from(der));
+            }
+        } else if in_cert {
+            current_base64.push_str(line);
+        }
+    }
+
+    if certs.is_empty() {
+        return Err(DumperError::Database(
+            "No valid PEM certificates found (expected '-----BEGIN CERTIFICATE-----')".to_string(),
+        ));
+    }
+    Ok(certs)
+}
+
+fn load_root_certs(root_cert_path: Option<&str>) -> Result<rustls::RootCertStore, DumperError> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    if let Some(path) = root_cert_path {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            DumperError::Database(format!(
+                "Failed to read PostgreSQL root certificate file '{}': {}",
+                path, e
+            ))
+        })?;
+        let certs = parse_pem_certificates(&content)?;
+        for cert in certs {
+            root_store.add(cert).map_err(|e| {
+                DumperError::Database(format!("Invalid root certificate in '{}': {}", path, e))
+            })?;
+        }
+    }
+    Ok(root_store)
+}
+
+pub fn parse_pg_connection_string(raw: &str) -> (String, bool, Option<String>) {
+    if raw.starts_with("postgres://") || raw.starts_with("postgresql://") {
+        if let Ok(mut parsed) = url::Url::parse(raw) {
+            let mut sslrootcert = None;
+            let mut verify = false;
+            let mut has_sslmode = false;
+            let mut new_pairs: Vec<(String, String)> = Vec::new();
+
+            for (k, v) in parsed.query_pairs() {
+                if k.eq_ignore_ascii_case("sslrootcert") {
+                    sslrootcert = Some(v.to_string());
+                    verify = true;
+                } else if k.eq_ignore_ascii_case("sslmode") {
+                    has_sslmode = true;
+                    if v.eq_ignore_ascii_case("verify-ca") || v.eq_ignore_ascii_case("verify-full")
+                    {
+                        verify = true;
+                        new_pairs.push(("sslmode".to_string(), "require".to_string()));
+                    } else {
+                        new_pairs.push((k.to_string(), v.to_string()));
+                    }
+                } else {
+                    new_pairs.push((k.to_string(), v.to_string()));
+                }
+            }
+
+            if sslrootcert.is_some() && !has_sslmode {
+                new_pairs.push(("sslmode".to_string(), "require".to_string()));
+            }
+
+            parsed.set_query(None);
+            if !new_pairs.is_empty() {
+                let mut serializer = parsed.query_pairs_mut();
+                for (k, v) in new_pairs {
+                    serializer.append_pair(&k, &v);
+                }
+            }
+            return (parsed.to_string(), verify, sslrootcert);
+        }
+    }
+
+    // Key-value connection string (libpq style: host=... port=... sslrootcert=...)
+    let mut sslrootcert = None;
+    let mut verify = false;
+    let mut has_sslmode = false;
+    let mut cleaned_parts = Vec::new();
+
+    for part in raw.split_whitespace() {
+        if let Some((k, v)) = part.split_once('=') {
+            let k_lower = k.to_lowercase();
+            let v_clean = v.trim_matches('\'').trim_matches('"');
+            if k_lower == "sslrootcert" {
+                sslrootcert = Some(v_clean.to_string());
+                verify = true;
+            } else if k_lower == "sslmode" {
+                has_sslmode = true;
+                if v_clean == "verify-ca" || v_clean == "verify-full" {
+                    verify = true;
+                    cleaned_parts.push("sslmode=require".to_string());
+                } else {
+                    cleaned_parts.push(part.to_string());
+                }
+            } else {
+                cleaned_parts.push(part.to_string());
+            }
+        } else {
+            cleaned_parts.push(part.to_string());
+        }
+    }
+
+    if sslrootcert.is_some() && !has_sslmode {
+        cleaned_parts.push("sslmode=require".to_string());
+    }
+
+    (cleaned_parts.join(" "), verify, sslrootcert)
+}
+
+fn create_rustls_connector(
+    verify: bool,
+    custom_root_store: Option<rustls::RootCertStore>,
+) -> MakeRustlsConnect {
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     if verify {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let root_store = custom_root_store.unwrap_or_else(|| {
+            let mut store = rustls::RootCertStore::empty();
+            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            store
+        });
         let client_config = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .expect("valid TLS protocol versions")
@@ -105,7 +293,9 @@ impl PostgresAdapter {
     }
 
     async fn connect_with_db(&self, db_override: Option<&str>) -> Result<Client, DumperError> {
-        let mut config: tokio_postgres::Config = self.url.parse().map_err(|e| {
+        let (normalized_url, verify, sslrootcert) = parse_pg_connection_string(&self.url);
+
+        let mut config: tokio_postgres::Config = normalized_url.parse().map_err(|e| {
             DumperError::Database(format!(
                 "Invalid PostgreSQL connection URL '{}': {}",
                 crate::error::sanitize_secrets(&self.url),
@@ -129,10 +319,12 @@ impl PostgresAdapter {
             });
             client
         } else {
-            let lower_url = self.url.to_lowercase();
-            let verify = lower_url.contains("sslmode=verify-ca")
-                || lower_url.contains("sslmode=verify-full");
-            let tls = create_rustls_connector(verify);
+            let root_store = if verify {
+                Some(load_root_certs(sslrootcert.as_deref())?)
+            } else {
+                None
+            };
+            let tls = create_rustls_connector(verify, root_store);
             match config.connect(tls).await {
                 Ok((client, connection)) => {
                     tokio::spawn(async move {
@@ -144,7 +336,8 @@ impl PostgresAdapter {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    if ssl_mode != tokio_postgres::config::SslMode::Require
+                    if !verify
+                        && ssl_mode != tokio_postgres::config::SslMode::Require
                         && (err_str.contains("server does not support TLS")
                             || err_str.contains("SSL is not supported")
                             || err_str.contains("server does not support SSL"))
@@ -849,6 +1042,12 @@ impl DatabaseAdapter for PostgresAdapter {
             .connect_with_db(options.target_database_override.as_deref())
             .await?;
 
+        if options.single_transaction {
+            client.batch_execute("BEGIN;").await.map_err(|e| {
+                DumperError::Restore(format!("Failed to start single transaction: {}", e))
+            })?;
+        }
+
         let mut tables_restored = 0;
         let mut records_processed = 0u64;
 
@@ -859,199 +1058,219 @@ impl DatabaseAdapter for PostgresAdapter {
         );
         let mut active_copy_sink: Option<ActiveCopySink> = None;
 
-        while let Some(record) = decoder.read_next_record().await? {
-            records_processed += 1;
-            match record {
-                StreamRecord::Header(h) => {
-                    // Check compatibility
-                    if h.engine != "postgresql" {
-                        return Err(DumperError::Restore(format!(
-                            "Cannot restore a '{}' backup into a PostgreSQL target database",
-                            h.engine
-                        )));
+        let run_restore = async {
+            while let Some(record) = decoder.read_next_record().await? {
+                records_processed += 1;
+                match record {
+                    StreamRecord::Header(h) => {
+                        // Check compatibility
+                        if h.engine != "postgresql" {
+                            return Err(DumperError::Restore(format!(
+                                "Cannot restore a '{}' backup into a PostgreSQL target database",
+                                h.engine
+                            )));
+                        }
                     }
-                }
-                StreamRecord::PreData(p) => {
-                    let trimmed = p.sql.trim();
-                    if trimmed.to_ascii_uppercase().starts_with("CREATE SCHEMA")
-                        && (p.name.starts_with("pg_")
-                            || p.name.starts_with("\"pg_")
-                            || p.name.contains("pg_temp")
-                            || p.name.contains("pg_toast"))
-                    {
-                        eprintln!("Skipping restore of reserved system schema '{}'", p.name);
-                        continue;
+                    StreamRecord::PreData(p) => {
+                        let trimmed = p.sql.trim();
+                        if trimmed.to_ascii_uppercase().starts_with("CREATE SCHEMA")
+                            && (p.name.starts_with("pg_")
+                                || p.name.starts_with("\"pg_")
+                                || p.name.contains("pg_temp")
+                                || p.name.contains("pg_toast"))
+                        {
+                            eprintln!("Skipping restore of reserved system schema '{}'", p.name);
+                            continue;
+                        }
+                        client.batch_execute(&p.sql).await.map_err(|e| {
+                            let detail = if let Some(db_err) = e.as_db_error() {
+                                format!(
+                                    "{}: {} (code: {:?})",
+                                    db_err.message(),
+                                    db_err.detail().unwrap_or(""),
+                                    db_err.code()
+                                )
+                            } else {
+                                e.to_string()
+                            };
+                            DumperError::Restore(format!(
+                                "Failed to execute pre-data DDL for '{}' (SQL: '{}'): {}",
+                                p.name, p.sql, detail
+                            ))
+                        })?;
                     }
-                    client.batch_execute(&p.sql).await.map_err(|e| {
-                        let detail = if let Some(db_err) = e.as_db_error() {
-                            format!(
-                                "{}: {} (code: {:?})",
-                                db_err.message(),
-                                db_err.detail().unwrap_or(""),
-                                db_err.code()
-                            )
-                        } else {
-                            e.to_string()
-                        };
-                        DumperError::Restore(format!(
-                            "Failed to execute pre-data DDL for '{}' (SQL: '{}'): {}",
-                            p.name, p.sql, detail
-                        ))
-                    })?;
-                }
-                StreamRecord::TableSchema(s) => {
-                    if options.drop_existing {
-                        let drop_sql = format!(
-                            "DROP TABLE IF EXISTS {}.{} CASCADE;",
-                            quote_pg_identifier(&s.schema_name),
-                            quote_pg_identifier(&s.table_name)
-                        );
-                        let _ = client.batch_execute(&drop_sql).await;
-                    }
+                    StreamRecord::TableSchema(s) => {
+                        if options.drop_existing {
+                            let drop_sql = format!(
+                                "DROP TABLE IF EXISTS {}.{} CASCADE;",
+                                quote_pg_identifier(&s.schema_name),
+                                quote_pg_identifier(&s.table_name)
+                            );
+                            let _ = client.batch_execute(&drop_sql).await;
+                        }
 
-                    // Pre-create any sequences referenced in column defaults to avoid relation does not exist error
-                    for col in &s.columns {
-                        if let Some(ref default_expr) = col.default_val {
-                            if let Some(create_seq_sql) =
-                                extract_sequence_from_default(default_expr, &s.schema_name)
-                            {
-                                let _ = client.batch_execute(&create_seq_sql).await;
+                        // Pre-create any sequences referenced in column defaults to avoid relation does not exist error
+                        for col in &s.columns {
+                            if let Some(ref default_expr) = col.default_val {
+                                if let Some(create_seq_sql) =
+                                    extract_sequence_from_default(default_expr, &s.schema_name)
+                                {
+                                    let _ = client.batch_execute(&create_seq_sql).await;
+                                }
+                            }
+                        }
+
+                        client.batch_execute(&s.create_sql).await.map_err(|e| {
+                            let msg = if let Some(d) = e.as_db_error() {
+                                format!("{}: {}", d.message(), d.detail().unwrap_or(""))
+                            } else {
+                                e.to_string()
+                            };
+                            DumperError::Restore(format!(
+                                "Failed to create table {}.{}: {} (SQL: {})",
+                                s.schema_name, s.table_name, msg, s.create_sql
+                            ))
+                        })?;
+                        tables_restored += 1;
+                    }
+                    StreamRecord::TableDataSlice(d) => {
+                        // Ensure active COPY sink is initialized for this table
+                        let needs_new_sink = match active_copy_sink {
+                            Some((ref s, ref t, _)) => s != &d.schema_name || t != &d.table_name,
+                            None => true,
+                        };
+
+                        if needs_new_sink {
+                            if let Some((old_s, old_t, mut old_sink)) = active_copy_sink.take() {
+                                old_sink.as_mut().finish().await.map_err(|e| {
+                                    DumperError::Restore(format!(
+                                        "COPY IN finish failed for {}.{}: {}",
+                                        old_s, old_t, e
+                                    ))
+                                })?;
+                            }
+                            if !d.is_last {
+                                let copy_sql = format!(
+                                    "COPY {}.{} FROM STDIN (FORMAT binary)",
+                                    quote_pg_identifier(&d.schema_name),
+                                    quote_pg_identifier(&d.table_name)
+                                );
+                                let sink =
+                                    Box::pin(client.copy_in(&copy_sql).await.map_err(|e| {
+                                        DumperError::Restore(format!(
+                                            "COPY IN initialization failed for {}.{}: {}",
+                                            d.schema_name, d.table_name, e
+                                        ))
+                                    })?);
+                                active_copy_sink =
+                                    Some((d.schema_name.clone(), d.table_name.clone(), sink));
+                            }
+                        }
+
+                        if let Some((_, _, ref mut sink)) = active_copy_sink {
+                            if !d.data.is_empty() {
+                                sink.as_mut()
+                                    .feed(bytes::Bytes::from(d.data))
+                                    .await
+                                    .map_err(|e| {
+                                        DumperError::Restore(format!(
+                                            "COPY IN data write failed: {}",
+                                            e
+                                        ))
+                                    })?;
+                                sink.as_mut().flush().await.map_err(|e| {
+                                    DumperError::Restore(format!("COPY IN flush failed: {}", e))
+                                })?;
+                            }
+                        }
+
+                        if d.is_last {
+                            if let Some((_, _, mut sink)) = active_copy_sink.take() {
+                                sink.as_mut().finish().await.map_err(|e| {
+                                    DumperError::Restore(format!(
+                                        "COPY IN finish failed for {}.{}: {}",
+                                        d.schema_name, d.table_name, e
+                                    ))
+                                })?;
                             }
                         }
                     }
-
-                    client.batch_execute(&s.create_sql).await.map_err(|e| {
-                        let msg = if let Some(d) = e.as_db_error() {
-                            format!("{}: {}", d.message(), d.detail().unwrap_or(""))
-                        } else {
-                            e.to_string()
-                        };
-                        DumperError::Restore(format!(
-                            "Failed to create table {}.{}: {} (SQL: {})",
-                            s.schema_name, s.table_name, msg, s.create_sql
-                        ))
-                    })?;
-                    tables_restored += 1;
-                }
-                StreamRecord::TableDataSlice(d) => {
-                    // Ensure active COPY sink is initialized for this table
-                    let needs_new_sink = match active_copy_sink {
-                        Some((ref s, ref t, _)) => s != &d.schema_name || t != &d.table_name,
-                        None => true,
-                    };
-
-                    if needs_new_sink {
-                        if let Some((old_s, old_t, mut old_sink)) = active_copy_sink.take() {
-                            old_sink.as_mut().finish().await.map_err(|e| {
-                                DumperError::Restore(format!(
-                                    "COPY IN finish failed for {}.{}: {}",
-                                    old_s, old_t, e
-                                ))
-                            })?;
-                        }
-                        if !d.is_last {
-                            let copy_sql = format!(
-                                "COPY {}.{} FROM STDIN (FORMAT binary)",
-                                quote_pg_identifier(&d.schema_name),
-                                quote_pg_identifier(&d.table_name)
-                            );
-                            let sink = Box::pin(client.copy_in(&copy_sql).await.map_err(|e| {
-                                DumperError::Restore(format!(
-                                    "COPY IN initialization failed for {}.{}: {}",
-                                    d.schema_name, d.table_name, e
-                                ))
-                            })?);
-                            active_copy_sink =
-                                Some((d.schema_name.clone(), d.table_name.clone(), sink));
-                        }
+                    StreamRecord::Sequence(seq) => {
+                        let regclass = format!(
+                            "{}.{}",
+                            quote_pg_identifier(&seq.schema_name),
+                            quote_pg_identifier(&seq.sequence_name)
+                        );
+                        let seq_sql = format!(
+                            "CREATE SEQUENCE IF NOT EXISTS {}; SELECT setval({}, {}, {});",
+                            regclass,
+                            quote_pg_literal(&regclass),
+                            seq.last_value,
+                            seq.is_called
+                        );
+                        client.batch_execute(&seq_sql).await.map_err(|e| {
+                            let msg = if let Some(d) = e.as_db_error() {
+                                format!("{}: {}", d.message(), d.detail().unwrap_or(""))
+                            } else {
+                                e.to_string()
+                            };
+                            DumperError::Restore(format!(
+                                "Failed to create and set sequence {}.{}: {}",
+                                seq.schema_name, seq.sequence_name, msg
+                            ))
+                        })?;
                     }
-
-                    if let Some((_, _, ref mut sink)) = active_copy_sink {
-                        if !d.data.is_empty() {
-                            sink.as_mut()
-                                .feed(bytes::Bytes::from(d.data))
-                                .await
-                                .map_err(|e| {
-                                    DumperError::Restore(format!(
-                                        "COPY IN data write failed: {}",
-                                        e
-                                    ))
-                                })?;
-                            sink.as_mut().flush().await.map_err(|e| {
-                                DumperError::Restore(format!("COPY IN flush failed: {}", e))
-                            })?;
-                        }
+                    StreamRecord::PostData(post) => {
+                        client.batch_execute(&post.sql).await.map_err(|e| {
+                            DumperError::Restore(format!(
+                                "Failed to execute post-data constraint/index '{}': {}",
+                                post.name, e
+                            ))
+                        })?;
                     }
-
-                    if d.is_last {
-                        if let Some((_, _, mut sink)) = active_copy_sink.take() {
-                            sink.as_mut().finish().await.map_err(|e| {
-                                DumperError::Restore(format!(
-                                    "COPY IN finish failed for {}.{}: {}",
-                                    d.schema_name, d.table_name, e
-                                ))
-                            })?;
-                        }
+                    StreamRecord::Routine(routine) => {
+                        client.batch_execute(&routine.sql).await.map_err(|e| {
+                            DumperError::Restore(format!(
+                                "Failed to execute routine SQL for '{}': {}",
+                                routine.name, e
+                            ))
+                        })?;
                     }
-                }
-                StreamRecord::Sequence(seq) => {
-                    let regclass = format!(
-                        "{}.{}",
-                        quote_pg_identifier(&seq.schema_name),
-                        quote_pg_identifier(&seq.sequence_name)
-                    );
-                    let seq_sql = format!(
-                        "CREATE SEQUENCE IF NOT EXISTS {}; SELECT setval({}, {}, {});",
-                        regclass,
-                        quote_pg_literal(&regclass),
-                        seq.last_value,
-                        seq.is_called
-                    );
-                    client.batch_execute(&seq_sql).await.map_err(|e| {
-                        let msg = if let Some(d) = e.as_db_error() {
-                            format!("{}: {}", d.message(), d.detail().unwrap_or(""))
-                        } else {
-                            e.to_string()
-                        };
-                        DumperError::Restore(format!(
-                            "Failed to create and set sequence {}.{}: {}",
-                            seq.schema_name, seq.sequence_name, msg
-                        ))
-                    })?;
-                }
-                StreamRecord::PostData(post) => {
-                    client.batch_execute(&post.sql).await.map_err(|e| {
-                        DumperError::Restore(format!(
-                            "Failed to execute post-data constraint/index '{}': {}",
-                            post.name, e
-                        ))
-                    })?;
-                }
-                StreamRecord::Routine(routine) => {
-                    client.batch_execute(&routine.sql).await.map_err(|e| {
-                        DumperError::Restore(format!(
-                            "Failed to execute routine SQL for '{}': {}",
-                            routine.name, e
-                        ))
-                    })?;
-                }
-                StreamRecord::Trailer(_) => {
-                    break;
+                    StreamRecord::Trailer(_) => {
+                        break;
+                    }
                 }
             }
-        }
 
-        // Finalize any active sink that was left unclosed before stream end
-        if let Some((s, t, mut sink)) = active_copy_sink.take() {
-            sink.as_mut().finish().await.map_err(|e| {
-                DumperError::Restore(format!("COPY IN finish failed for {}.{}: {}", s, t, e))
-            })?;
-        }
+            // Finalize any active sink that was left unclosed before stream end
+            if let Some((s, t, mut sink)) = active_copy_sink.take() {
+                sink.as_mut().finish().await.map_err(|e| {
+                    DumperError::Restore(format!("COPY IN finish failed for {}.{}: {}", s, t, e))
+                })?;
+            }
 
-        Ok(RestoreStats {
-            tables_restored,
-            records_processed,
-        })
+            Ok::<(), DumperError>(())
+        };
+
+        match run_restore.await {
+            Ok(()) => {
+                if options.single_transaction {
+                    client.batch_execute("COMMIT;").await.map_err(|e| {
+                        DumperError::Restore(format!("Failed to commit single transaction: {}", e))
+                    })?;
+                }
+                Ok(RestoreStats {
+                    tables_restored,
+                    records_processed,
+                })
+            }
+            Err(e) => {
+                if options.single_transaction {
+                    let _ = client.batch_execute("ROLLBACK;").await;
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1309,5 +1528,65 @@ mod tests {
         assert_eq!(sorted.len(), 2);
         assert_eq!(sorted[0].name, "view_a");
         assert_eq!(sorted[1].name, "view_b");
+    }
+
+    #[test]
+    fn test_parse_pg_connection_string_verify_ca_and_sslrootcert() {
+        let uri = "postgresql://user:pass@localhost:5432/db?sslmode=verify-ca&sslrootcert=/etc/ssl/ca.crt";
+        let (normalized, verify, root_cert) = parse_pg_connection_string(uri);
+        assert!(verify);
+        assert_eq!(root_cert.as_deref(), Some("/etc/ssl/ca.crt"));
+        // normalized URL must have sslmode=require and no sslrootcert
+        assert!(normalized.contains("sslmode=require"));
+        assert!(!normalized.contains("sslrootcert"));
+        // tokio_postgres::Config must parse normalized URL successfully
+        assert!(normalized.parse::<tokio_postgres::Config>().is_ok());
+    }
+
+    #[test]
+    fn test_parse_pg_connection_string_key_value() {
+        let conn = "host=localhost port=5432 user=usr sslmode=verify-full sslrootcert='/path/to/ca.crt' dbname=app";
+        let (normalized, verify, root_cert) = parse_pg_connection_string(conn);
+        assert!(verify);
+        assert_eq!(root_cert.as_deref(), Some("/path/to/ca.crt"));
+        assert!(normalized.contains("sslmode=require"));
+        assert!(!normalized.contains("sslrootcert"));
+        assert!(normalized.parse::<tokio_postgres::Config>().is_ok());
+    }
+
+    #[test]
+    fn test_parse_pg_connection_string_default_unverified() {
+        let uri = "postgresql://user:pass@localhost:5432/db?sslmode=require";
+        let (normalized, verify, root_cert) = parse_pg_connection_string(uri);
+        assert!(!verify);
+        assert!(root_cert.is_none());
+        assert!(normalized.contains("sslmode=require"));
+        assert!(normalized.parse::<tokio_postgres::Config>().is_ok());
+    }
+
+    #[test]
+    fn test_decode_base64_der() {
+        let original = b"hello world secure root certificate content";
+        // Manual base64 test vector: "aGVsbG8gd29ybGQgc2VjdXJlIHJvb3QgY2VydGlmaWNhdGUgY29udGVudA=="
+        let encoded = "aGVsbG8gd29ybGQgc2VjdXJlIHJvb3QgY2VydGlmaWNhdGUgY29udGVudA==";
+        let decoded = decode_base64_der(encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_parse_pem_certificates() {
+        let pem = "-----BEGIN CERTIFICATE-----\n\
+                   aGVsbG8gd29ybGQgc2VjdXJlIHJvb3QgY2VydGlmaWNhdGUgY29udGVudA==\n\
+                   -----END CERTIFICATE-----";
+        let certs = parse_pem_certificates(pem).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(
+            certs[0].as_ref(),
+            b"hello world secure root certificate content"
+        );
+
+        // Invalid PEM missing headers
+        let invalid = "not a valid certificate";
+        assert!(parse_pem_certificates(invalid).is_err());
     }
 }

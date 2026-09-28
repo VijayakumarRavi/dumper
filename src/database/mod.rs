@@ -25,10 +25,11 @@ pub struct BackupStats {
     pub logical_bytes: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {
     pub target_database_override: Option<String>,
     pub drop_existing: bool,
+    pub single_transaction: bool,
 }
 
 #[derive(Debug, Clone)]

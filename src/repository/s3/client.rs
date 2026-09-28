@@ -1,4 +1,4 @@
-use crate::error::DumperError;
+use crate::error::{sanitize_secrets, DumperError};
 use crate::repository::backend::StorageBackend;
 use crate::repository::s3::sigv4::SigV4Signer;
 use chrono::Utc;
@@ -7,6 +7,7 @@ use reqwest::{Client, Method, Response, StatusCode};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+#[derive(Debug)]
 pub struct S3Client {
     client: Client,
     endpoint: String,
@@ -19,6 +20,7 @@ pub struct S3Client {
 }
 
 impl S3Client {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         endpoint: Option<String>,
         bucket: String,
@@ -27,13 +29,32 @@ impl S3Client {
         access_key: String,
         secret_key: String,
         session_token: Option<String>,
+        ca_cert_path: Option<&str>,
     ) -> Result<Self, DumperError> {
         let default_endpoint = format!("https://s3.{}.amazonaws.com", region);
         let endpoint_url = endpoint.unwrap_or(default_endpoint);
 
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .timeout(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(10));
+
+        if let Some(ca_path) = ca_cert_path {
+            let cert_bytes = std::fs::read(ca_path).map_err(|e| {
+                DumperError::Config(format!(
+                    "Failed to read custom S3 CA certificate file '{}': {}",
+                    ca_path, e
+                ))
+            })?;
+            let cert = reqwest::Certificate::from_pem(&cert_bytes).map_err(|e| {
+                DumperError::Config(format!(
+                    "Failed to parse custom S3 CA certificate PEM in '{}': {}",
+                    ca_path, e
+                ))
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
+
+        let client = builder
             .build()
             .map_err(|e| DumperError::S3(format!("Failed to build HTTP client: {}", e)))?;
 
@@ -168,7 +189,7 @@ impl S3Client {
                     }
 
                     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                        let err_body = resp.text().await.unwrap_or_default();
+                        let err_body = sanitize_secrets(&resp.text().await.unwrap_or_default());
                         return Err(DumperError::S3(format!(
                             "S3 Authentication/Authorization failed: HTTP {} error on {} {}: {}",
                             status, method, key, err_body
@@ -184,7 +205,7 @@ impl S3Client {
                         continue;
                     }
 
-                    let err_body = resp.text().await.unwrap_or_default();
+                    let err_body = sanitize_secrets(&resp.text().await.unwrap_or_default());
                     return Err(DumperError::S3(format!(
                         "S3 HTTP {} error on {} {}: {}",
                         status, method, key, err_body
@@ -214,7 +235,7 @@ impl StorageBackend for S3Client {
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = sanitize_secrets(&resp.text().await.unwrap_or_default());
             return Err(DumperError::S3(format!(
                 "Failed to PUT S3 object '{}' (HTTP {}): {}",
                 key, status, body
@@ -236,7 +257,7 @@ impl StorageBackend for S3Client {
         }
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = sanitize_secrets(&resp.text().await.unwrap_or_default());
             return Err(DumperError::S3(format!(
                 "Failed to GET S3 object '{}' (HTTP {}): {}",
                 key, status, body
@@ -291,7 +312,7 @@ impl StorageBackend for S3Client {
             .await?;
         if !resp.status().is_success() && resp.status() != StatusCode::NOT_FOUND {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = sanitize_secrets(&resp.text().await.unwrap_or_default());
             return Err(DumperError::S3(format!(
                 "Failed to DELETE S3 object '{}' (HTTP {}): {}",
                 key, status, body
@@ -318,7 +339,7 @@ impl StorageBackend for S3Client {
                 .await?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+                let body = sanitize_secrets(&resp.text().await.unwrap_or_default());
                 return Err(DumperError::S3(format!(
                     "Failed to list S3 objects with prefix '{}' (HTTP {}): {}",
                     search_prefix, status, body
@@ -507,6 +528,7 @@ mod tests {
             "test_access".into(),
             "test_secret".into(),
             None,
+            None,
         )
         .unwrap();
 
@@ -554,11 +576,31 @@ mod tests {
             "test_access".into(),
             "test_secret".into(),
             None,
+            None,
         )
         .unwrap();
         let url_trailing = client_with_slash.build_request_url("");
         assert_eq!(url_trailing, "http://127.0.0.1:9000/my-backups");
         let parsed_trailing = url::Url::parse(&url_trailing).unwrap();
         assert_eq!(parsed_trailing.path(), "/my-backups");
+    }
+
+    #[test]
+    fn test_s3_ca_cert_nonexistent_fails() {
+        let res = S3Client::new(
+            Some("https://s3.amazonaws.com".into()),
+            "my-backups".into(),
+            "".into(),
+            "us-east-1".into(),
+            "access".into(),
+            "secret".into(),
+            None,
+            Some("/nonexistent/ca.pem"),
+        );
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to read custom S3 CA certificate"));
     }
 }

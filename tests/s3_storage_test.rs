@@ -104,6 +104,7 @@ async fn test_minio_s3_backup_restore_roundtrip_and_deduplication() {
             "minioadmin".into(),
             "minioadmin".into(),
             None,
+            None,
         )
         .unwrap(),
     );
@@ -197,6 +198,7 @@ async fn test_s3_403_forbidden_rejection_no_retry() {
         "minioadmin".into(),
         "wrong-secret-key-12345".into(),
         None,
+        None,
     )
     .unwrap();
 
@@ -237,6 +239,7 @@ async fn test_s3_404_not_found() {
         "us-east-1".into(),
         "minioadmin".into(),
         "minioadmin".into(),
+        None,
         None,
     )
     .unwrap();
@@ -289,6 +292,7 @@ async fn test_s3_retry_on_transient_503_and_429() {
         "access".into(),
         "secret".into(),
         None,
+        None,
     )
     .unwrap();
 
@@ -317,6 +321,7 @@ async fn test_s3_missing_blob_and_corrupt_snapshot_detection() {
             "us-east-1".into(),
             "minioadmin".into(),
             "minioadmin".into(),
+            None,
             None,
         )
         .unwrap(),
