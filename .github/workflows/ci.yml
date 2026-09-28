@@ -169,8 +169,8 @@ jobs:
             fi
             sleep 0.2
           done
-          NODE_ID=\$(garage -c /tmp/garage/garage.toml node id 2>/dev/null | head -n 1)
-          garage -c /tmp/garage/garage.toml layout assign -z dc1 -c 1G "\$NODE_ID"
+          NODE_ID=$(garage -c /tmp/garage/garage.toml node id 2>/dev/null | head -n 1)
+          garage -c /tmp/garage/garage.toml layout assign -z dc1 -c 1G "$NODE_ID"
           garage -c /tmp/garage/garage.toml layout apply --version 1
           garage -c /tmp/garage/garage.toml key import --yes GK0123456789abcdef01234567 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           garage -c /tmp/garage/garage.toml bucket create test-bucket

@@ -117,12 +117,12 @@ run_sql -N -s -e \
 echo "--> Performing Dumper backup..."
 if [[ "$REPO" == s3://* ]]; then
     "$DUMPER_BIN" backup "$DB_URL" --tag "e2e-mysql"
-    SNAP_ID=$("$DUMPER_BIN" --json snapshots | awk -F'"' '/"id":/{print $4; exit}')
+    SNAP_ID=$("$DUMPER_BIN" --json snapshots | awk -F'"' '/"id":/{if (!id) id=$4} END{print id}')
     "$DUMPER_BIN" verify "$SNAP_ID" --restore-test
 else
     "$DUMPER_BIN" -r "$REPO" init
     "$DUMPER_BIN" -r "$REPO" backup "$DB_URL" --tag "e2e-mysql"
-    SNAP_ID=$("$DUMPER_BIN" -r "$REPO" --json snapshots | awk -F'"' '/"id":/{print $4; exit}')
+    SNAP_ID=$("$DUMPER_BIN" -r "$REPO" --json snapshots | awk -F'"' '/"id":/{if (!id) id=$4} END{print id}')
     "$DUMPER_BIN" -r "$REPO" verify "$SNAP_ID" --restore-test
 fi
 
