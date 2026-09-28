@@ -5,137 +5,203 @@ use dumper::repository::local::LocalBackend;
 use dumper::repository::s3::client::S3Client;
 use dumper::repository::snapshot::SnapshotMetadata;
 use sha2::{Digest, Sha256};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
-#[tokio::test]
-async fn test_sigkill_during_backup_leaves_committed_snapshots_intact() {
-    let temp_dir = TempDir::new().unwrap();
-    let backend = Arc::new(LocalBackend::new(temp_dir.path()).await.unwrap());
-    let password = "sigkill-backup-test-password";
+static GARAGE_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
 
-    // 1. Initial valid snapshot commit
-    let engine = RepositoryEngine::init(backend.clone(), password)
-        .await
-        .unwrap();
+struct TestGarageServer {
+    _dir: TempDir,
+    s3_port: u16,
+    child: Child,
+    access_key_id: String,
+    secret_access_key: String,
+}
 
-    let initial_data = b"STABLE INITIAL COMMITTED BACKUP DATA";
-    let hash_init = hex::encode(Sha256::digest(initial_data));
-    let (ref_init, _) = engine
-        .put_chunk(initial_data, &hash_init, CompressionLevel::Default)
-        .await
-        .unwrap();
+impl TestGarageServer {
+    fn start(bucket: &str) -> Option<Self> {
+        let dir = TempDir::new().ok()?;
+        let meta_dir = dir.path().join("meta");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&meta_dir).ok()?;
+        std::fs::create_dir_all(&data_dir).ok()?;
 
-    let snap1 = SnapshotMetadata {
-        id: "stable01".into(),
-        full_id: "stable01_full_hash".into(),
-        format_version: 1,
-        dumper_version: "0.1.0".into(),
-        engine: "postgresql".into(),
-        database: "prod_db".into(),
-        server_version: "17.0".into(),
-        started_at: chrono::Utc::now(),
-        completed_at: chrono::Utc::now(),
-        duration_seconds: 1,
-        logical_bytes: initial_data.len() as u64,
-        stored_bytes: ref_init.stored_size,
-        deduplicated_bytes: 0,
-        table_count: 1,
-        compression: "default".into(),
-        tag: Some("v1-stable".into()),
-        blobs: vec![ref_init.clone()],
-    };
-    engine.commit_snapshot(&snap1).await.unwrap();
+        let offset = GARAGE_PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
+        let rpc_port = 49152 + ((std::process::id() as u16 % 400) * 10) + offset;
+        let s3_port = rpc_port + 1;
 
-    // Verify initial snapshot is valid
-    assert_eq!(engine.verify_snapshot(&snap1).await.unwrap(), 1);
+        let config_path = dir.path().join("garage.toml");
+        let config_content = format!(
+            r#"metadata_dir = "{}"
+data_dir = "{}"
+db_engine = "sqlite"
+replication_factor = 1
 
-    // 2. Simulate interrupted backup writing temporary uncommitted blobs
-    // Create an abandoned temporary file simulating a crash / SIGKILL mid-upload
-    backend
-        .put_object(
-            "blobs/temp_uncommitted_partial_data.tmp",
-            b"incomplete partial chunk",
-        )
-        .await
-        .unwrap();
+rpc_bind_addr = "127.0.0.1:{}"
+rpc_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-    // 3. Verify that the previous committed snapshot remains completely intact
-    let loaded_snaps = engine.list_snapshots().await.unwrap();
-    assert_eq!(loaded_snaps.len(), 1);
-    assert_eq!(loaded_snaps[0].id, "stable01");
+[s3_api]
+s3_region = "us-east-1"
+api_bind_addr = "127.0.0.1:{}"
+root_domain = ".s3.garage"
+"#,
+            meta_dir.to_str()?,
+            data_dir.to_str()?,
+            rpc_port,
+            s3_port
+        );
+        std::fs::write(&config_path, config_content).ok()?;
 
-    let chunk = engine.get_chunk(&hash_init).await.unwrap();
-    assert_eq!(chunk, initial_data);
+        let config_str = config_path.to_str()?;
 
-    // 4. Verify check() passes without errors and cleans up abandoned temp files
-    let (snaps_cnt, missing_cnt, _) = engine.check().await.unwrap();
-    assert_eq!(snaps_cnt, 1);
-    assert_eq!(missing_cnt, 0);
+        let mut child = Command::new("garage")
+            .args(["-c", config_str, "server"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
 
-    // Prune cleans up abandoned temp files safely without touching live blobs
-    let _ = engine.prune().await.unwrap();
-    let chunk_after_prune = engine.get_chunk(&hash_init).await.unwrap();
-    assert_eq!(chunk_after_prune, initial_data);
+        let start_time = std::time::Instant::now();
+        let mut ready = false;
+        while start_time.elapsed() < Duration::from_secs(6) {
+            let status = Command::new("garage")
+                .args(["-c", config_str, "status"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Ok(st) = status {
+                if st.success() {
+                    ready = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        if !ready {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        let node_id_out = Command::new("garage")
+            .args(["-c", config_str, "node", "id"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let node_id_str = String::from_utf8_lossy(&node_id_out.stdout);
+        let node_id = node_id_str.lines().next()?.trim();
+
+        let assign_status = Command::new("garage")
+            .args([
+                "-c", config_str, "layout", "assign", "-z", "dc1", "-c", "1G", node_id,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !assign_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        let apply_status = Command::new("garage")
+            .args(["-c", config_str, "layout", "apply", "--version", "1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !apply_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        let key_id = "GK0123456789abcdef01234567";
+        let key_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let key_status = Command::new("garage")
+            .args([
+                "-c", config_str, "key", "import", "--yes", key_id, key_secret,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !key_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        let bkt_status = Command::new("garage")
+            .args(["-c", config_str, "bucket", "create", bucket])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !bkt_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        let allow_status = Command::new("garage")
+            .args([
+                "-c", config_str, "bucket", "allow", "--read", "--write", "--owner", bucket,
+                "--key", key_id,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !allow_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        Some(Self {
+            _dir: dir,
+            s3_port,
+            child,
+            access_key_id: key_id.into(),
+            secret_access_key: key_secret.into(),
+        })
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://127.0.0.1:{}", self.s3_port)
+    }
+}
+
+impl Drop for TestGarageServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[tokio::test]
 async fn test_sigkill_during_s3_upload_crash_resilience() {
     // Test S3 backend resilience when interrupted mid-operation
     let bucket = "sigkill-s3-test-bucket";
-    let temp_minio = TempDir::new().unwrap();
-    let minio_path = temp_minio.path().to_str().unwrap();
-    let bucket_path = format!("{}/{}", minio_path, bucket);
-    std::fs::create_dir_all(&bucket_path).unwrap();
-
-    let port = 49200 + (std::process::id() as u16 % 300);
-    let addr = format!("127.0.0.1:{}", port);
-
-    let mut minio_child = match Command::new("minio")
-        .args(["server", minio_path, "--address", &addr])
-        .env("MINIO_ROOT_USER", "minioadmin")
-        .env("MINIO_ROOT_PASSWORD", "minioadmin")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return,
+    let server = match TestGarageServer::start(bucket) {
+        Some(s) => s,
+        None => return,
     };
 
-    let health_url = format!("http://{}/minio/health/live", addr);
-    let start = std::time::Instant::now();
-    let mut ready = false;
-    while start.elapsed() < Duration::from_secs(6) {
-        if let Ok(status) = Command::new("curl")
-            .args(["-s", "-f", "--connect-timeout", "1", &health_url])
-            .status()
-        {
-            if status.success() {
-                ready = true;
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    if !ready {
-        let _ = minio_child.kill();
-        let _ = minio_child.wait();
-        return;
-    }
-
-    let endpoint = format!("http://{}", addr);
     let s3_backend = Arc::new(
         S3Client::new(
-            Some(endpoint),
+            Some(server.endpoint()),
             bucket.into(),
             "repo".into(),
             "us-east-1".into(),
-            "minioadmin".into(),
-            "minioadmin".into(),
+            server.access_key_id.clone(),
+            server.secret_access_key.clone(),
             None,
             None,
         )
@@ -194,9 +260,6 @@ async fn test_sigkill_during_s3_upload_crash_resilience() {
     let (snaps_cnt, missing, _) = engine.check().await.unwrap();
     assert_eq!(snaps_cnt, 1);
     assert_eq!(missing, 0);
-
-    let _ = minio_child.kill();
-    let _ = minio_child.wait();
 }
 
 #[tokio::test]

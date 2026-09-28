@@ -12,52 +12,70 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-static MINIO_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+static GARAGE_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
 
-struct TestMinioServer {
+struct TestGarageServer {
     _dir: TempDir,
-    port: u16,
+    s3_port: u16,
     child: Child,
+    access_key_id: String,
+    secret_access_key: String,
 }
 
-impl TestMinioServer {
+impl TestGarageServer {
     fn start(bucket: &str) -> Option<Self> {
         let dir = TempDir::new().ok()?;
-        let path = dir.path().to_str()?;
+        let meta_dir = dir.path().join("meta");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&meta_dir).ok()?;
+        std::fs::create_dir_all(&data_dir).ok()?;
 
-        // Pre-create bucket directory so MinIO serves it immediately
-        let bucket_path = format!("{}/{}", path, bucket);
-        std::fs::create_dir_all(&bucket_path).ok()?;
+        let offset = GARAGE_PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
+        let rpc_port = 49152 + ((std::process::id() as u16 % 400) * 10) + offset;
+        let s3_port = rpc_port + 1;
 
-        let offset = MINIO_PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let port = 49152 + ((std::process::id() as u16 % 500) * 10) + offset;
-        let addr = format!("127.0.0.1:{}", port);
+        let config_path = dir.path().join("garage.toml");
+        let config_content = format!(
+            r#"metadata_dir = "{}"
+data_dir = "{}"
+db_engine = "sqlite"
+replication_factor = 1
 
-        let child = Command::new("minio")
-            .args(["server", path, "--address", &addr])
-            .env("MINIO_ROOT_USER", "minioadmin")
-            .env("MINIO_ROOT_PASSWORD", "minioadmin")
+rpc_bind_addr = "127.0.0.1:{}"
+rpc_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[s3_api]
+s3_region = "us-east-1"
+api_bind_addr = "127.0.0.1:{}"
+root_domain = ".s3.garage"
+"#,
+            meta_dir.to_str()?,
+            data_dir.to_str()?,
+            rpc_port,
+            s3_port
+        );
+        std::fs::write(&config_path, config_content).ok()?;
+
+        let config_str = config_path.to_str()?;
+
+        let mut child = Command::new("garage")
+            .args(["-c", config_str, "server"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .ok()?;
 
-        let server = Self {
-            _dir: dir,
-            port,
-            child,
-        };
-
-        // Poll health endpoint until ready (up to 6 seconds)
-        let health_url = format!("http://{}/minio/health/live", addr);
+        // Wait until garage node is responsive
         let start_time = std::time::Instant::now();
         let mut ready = false;
         while start_time.elapsed() < Duration::from_secs(6) {
-            let status = Command::new("curl")
-                .args(["-s", "-f", "--connect-timeout", "1", &health_url])
-                .output();
-            if let Ok(out) = status {
-                if out.status.success() {
+            let status = Command::new("garage")
+                .args(["-c", config_str, "status"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Ok(st) = status {
+                if st.success() {
                     ready = true;
                     break;
                 }
@@ -66,18 +84,109 @@ impl TestMinioServer {
         }
 
         if !ready {
+            let _ = child.kill();
+            let _ = child.wait();
             return None;
         }
 
-        Some(server)
+        // Get node ID
+        let node_id_out = Command::new("garage")
+            .args(["-c", config_str, "node", "id"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let node_id_str = String::from_utf8_lossy(&node_id_out.stdout);
+        let node_id = node_id_str.lines().next()?.trim();
+
+        // Assign layout
+        let assign_status = Command::new("garage")
+            .args([
+                "-c", config_str, "layout", "assign", "-z", "dc1", "-c", "1G", node_id,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !assign_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        // Apply layout
+        let apply_status = Command::new("garage")
+            .args(["-c", config_str, "layout", "apply", "--version", "1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !apply_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        // Import access key
+        let key_id = "GK0123456789abcdef01234567";
+        let key_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let key_status = Command::new("garage")
+            .args([
+                "-c", config_str, "key", "import", "--yes", key_id, key_secret,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !key_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        // Create bucket
+        let bkt_status = Command::new("garage")
+            .args(["-c", config_str, "bucket", "create", bucket])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !bkt_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        // Allow key permissions on bucket
+        let allow_status = Command::new("garage")
+            .args([
+                "-c", config_str, "bucket", "allow", "--read", "--write", "--owner", bucket,
+                "--key", key_id,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !allow_status.success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        Some(Self {
+            _dir: dir,
+            s3_port,
+            child,
+            access_key_id: key_id.into(),
+            secret_access_key: key_secret.into(),
+        })
     }
 
     fn endpoint(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        format!("http://127.0.0.1:{}", self.s3_port)
     }
 }
 
-impl Drop for TestMinioServer {
+impl Drop for TestGarageServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -85,12 +194,12 @@ impl Drop for TestMinioServer {
 }
 
 #[tokio::test]
-async fn test_minio_s3_backup_restore_roundtrip_and_deduplication() {
+async fn test_garage_s3_backup_restore_roundtrip_and_deduplication() {
     let bucket = "dumper-test-bucket";
-    let server = match TestMinioServer::start(bucket) {
+    let server = match TestGarageServer::start(bucket) {
         Some(s) => s,
         None => {
-            eprintln!("MinIO not available or failed to start, skipping test.");
+            eprintln!("Garage not available or failed to start, skipping test.");
             return;
         }
     };
@@ -101,15 +210,15 @@ async fn test_minio_s3_backup_restore_roundtrip_and_deduplication() {
             bucket.into(),
             "backups/app".into(),
             "us-east-1".into(),
-            "minioadmin".into(),
-            "minioadmin".into(),
+            server.access_key_id.clone(),
+            server.secret_access_key.clone(),
             None,
             None,
         )
         .unwrap(),
     );
 
-    let password = "minio-production-password-456";
+    let password = "garage-production-password-456";
 
     // 1. Initialize Repository over S3
     let engine = RepositoryEngine::init(s3_backend.clone(), password)
@@ -184,7 +293,7 @@ async fn test_minio_s3_backup_restore_roundtrip_and_deduplication() {
 #[tokio::test]
 async fn test_s3_403_forbidden_rejection_no_retry() {
     let bucket = "dumper-auth-test-bucket";
-    let server = match TestMinioServer::start(bucket) {
+    let server = match TestGarageServer::start(bucket) {
         Some(s) => s,
         None => return,
     };
@@ -195,7 +304,7 @@ async fn test_s3_403_forbidden_rejection_no_retry() {
         bucket.into(),
         "backups".into(),
         "us-east-1".into(),
-        "minioadmin".into(),
+        server.access_key_id.clone(),
         "wrong-secret-key-12345".into(),
         None,
         None,
@@ -227,7 +336,7 @@ async fn test_s3_403_forbidden_rejection_no_retry() {
 #[tokio::test]
 async fn test_s3_404_not_found() {
     let bucket = "dumper-404-test-bucket";
-    let server = match TestMinioServer::start(bucket) {
+    let server = match TestGarageServer::start(bucket) {
         Some(s) => s,
         None => return,
     };
@@ -237,8 +346,8 @@ async fn test_s3_404_not_found() {
         bucket.into(),
         "backups".into(),
         "us-east-1".into(),
-        "minioadmin".into(),
-        "minioadmin".into(),
+        server.access_key_id.clone(),
+        server.secret_access_key.clone(),
         None,
         None,
     )
@@ -308,7 +417,7 @@ async fn test_s3_retry_on_transient_503_and_429() {
 #[tokio::test]
 async fn test_s3_missing_blob_and_corrupt_snapshot_detection() {
     let bucket = "dumper-corrupt-test-bucket";
-    let server = match TestMinioServer::start(bucket) {
+    let server = match TestGarageServer::start(bucket) {
         Some(s) => s,
         None => return,
     };
@@ -319,8 +428,8 @@ async fn test_s3_missing_blob_and_corrupt_snapshot_detection() {
             bucket.into(),
             "repo".into(),
             "us-east-1".into(),
-            "minioadmin".into(),
-            "minioadmin".into(),
+            server.access_key_id.clone(),
+            server.secret_access_key.clone(),
             None,
             None,
         )

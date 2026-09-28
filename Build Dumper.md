@@ -244,7 +244,7 @@ The primary remote backend is:
 It must work with:
 
 - Amazon S3
-- MinIO
+- Garage S3
 - Cloudflare R2
 - Wasabi
 - Backblaze B2 S3 API
@@ -1152,7 +1152,7 @@ For a custom S3 endpoint:
 ```bash
 dumper init \
   --repository s3://my-bucket/postgres \
-  --endpoint https://minio.example.com
+  --endpoint https://garage.example.com
 ```
 
 The repository should contain:
@@ -1810,7 +1810,7 @@ Use integration tests for:
 PostgreSQL
 MySQL
 MariaDB
-MinIO
+Garage S3
 local filesystem
 ```
 
@@ -1841,7 +1841,7 @@ Integration test matrix should include:
 PostgreSQL
 MySQL
 MariaDB
-MinIO
+Garage S3
 ```
 
 Run end-to-end scenarios:
@@ -2912,7 +2912,7 @@ Memory limit: 128 MB
 
 Connect to a production-like PostgreSQL database.
 
-Store the repository in MinIO/S3.
+Store the repository in Garage S3.
 
 Run:
 

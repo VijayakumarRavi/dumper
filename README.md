@@ -21,7 +21,7 @@ Designed to run safely inside edge containers (64–128 MB RAM, 0.25–1 vCPU) w
 - **Content-Addressed Deduplication**: Chunks are content-hashed (SHA-256) and deduplicated across all snapshots. Identical data is stored only once.
 - **Client-Side Authenticated Encryption**: Authenticated AEAD encryption (**XChaCha20-Poly1305**) with a master key derived via **Argon2id** password hashing. Keys never leave the client.
 - **Streaming Zstandard Compression**: Multi-level zstd compression (`none`, `fast`, `default`, `max`).
-- **S3 as a First-Class Backend**: Built-in AWS SigV4 signer supporting Amazon S3, MinIO, Cloudflare R2, Wasabi, Backblaze B2, and Garage (MinIO continuously validated in CI; see COMPATIBILITY.md for details).
+- **S3 as a First-Class Backend**: Built-in AWS SigV4 signer supporting Amazon S3, Garage, Cloudflare R2, Wasabi, Backblaze B2, and other S3-compatible backends (Garage S3 continuously validated in CI; see COMPATIBILITY.md for details).
 - **Crash Safety**: Atomic snapshot commits. Partial or failed backups remain uncommitted and never corrupt previous snapshots.
 - **Full Lifecycle**: `init`, `backup`, `snapshots`, `info`, `restore`, `verify`, `check`, `forget`, `prune`, `stats`, and `unlock`.
 
@@ -37,14 +37,14 @@ Designed to run safely inside edge containers (64–128 MB RAM, 0.25–1 vCPU) w
 dumper init --repository /mnt/backups/postgres
 ```
 
-#### S3-Compatible Storage (AWS, MinIO, Garage, R2)
+#### S3-Compatible Storage (AWS, Garage, R2, Wasabi)
 
 ```bash
 export DUMPER_REPOSITORY="s3://my-backups/postgres"
 export DUMPER_PASSWORD="secure-repo-password"
 export DUMPER_S3_ENDPOINT="https://s3.example.com"
-export DUMPER_S3_ACCESS_KEY_ID="minioadmin"
-export DUMPER_S3_SECRET_ACCESS_KEY="minioadmin"
+export DUMPER_S3_ACCESS_KEY_ID="GK0123456789abcdef01234567"
+export DUMPER_S3_SECRET_ACCESS_KEY="your-s3-secret-key"
 
 dumper init
 ```

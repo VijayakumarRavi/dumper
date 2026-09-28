@@ -39,21 +39,21 @@ The following versions target the same wire protocols and SQL dialects, but are 
 | Backend              | Protocol                | CI Testing Status  | Details                                                                                                                                                            |
 | -------------------- | ----------------------- | :----------------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Local Filesystem** | POSIX / Windows / macOS | **Verified in CI** | Atomic rename writes, directory sharding (`data/xx/yyyy...`), path traversal protection                                                                            |
-| **MinIO**            | S3 REST / SigV4         | **Verified in CI** | Automated container & process tests on Linux, macOS, Windows; multipart uploads, SigV4 authentication, path-style addressing, HTTP 403/404/429/503 error injection |
+| **Garage S3**        | S3 REST / SigV4         | **Verified in CI** | Automated daemon & process tests on Linux & macOS; multipart uploads, SigV4 authentication, path-style addressing, HTTP 403/404/429/503 error injection             |
 
 ### S3-Compatible Cloud Providers (Target Supported via S3 API)
 
 Dumper implements standard AWS SigV4 request signing over HTTP/HTTPS, supporting custom endpoints and path-style addressing. The following cloud providers expose S3-compatible APIs and are target architectures:
 
 - **Amazon Web Services (AWS S3)** (Standard, S3 Standard-IA)
+- **Garage S3** (Continuous CI and local devshell integration)
 - **Cloudflare R2**
-- **Garage** (Local devshell integration available)
 - **Wasabi**
 - **Backblaze B2**
 - **Google Cloud Storage (GCS)** (via S3 interoperability keys)
 
 > [!WARNING]
-> **Provider Idiosyncrasy Disclaimer**: Automated CI test suites validate MinIO and the local filesystem. While Dumper uses standard S3 REST requests with AWS SigV4 signatures, third-party and commercial cloud providers possess vendor-specific idiosyncrasies (e.g. multipart part size minimums, eventual consistency windows, proprietary rate limit responses, header casing, or signed URL expiration policies). **MinIO test results do not constitute end-to-end certification of every commercial S3 provider.** Operators are required to execute full backup and restore drill cycles against their specific cloud provider and bucket configurations prior to production deployment.
+> **Provider Idiosyncrasy Disclaimer**: Automated CI test suites validate Garage S3 and the local filesystem. While Dumper uses standard S3 REST requests with AWS SigV4 signatures, third-party and commercial cloud providers possess vendor-specific idiosyncrasies (e.g. multipart part size minimums, eventual consistency windows, proprietary rate limit responses, header casing, or signed URL expiration policies). **Garage S3 test results do not constitute end-to-end certification of every commercial S3 provider.** Operators are required to execute full backup and restore drill cycles against their specific cloud provider and bucket configurations prior to production deployment.
 
 ---
 

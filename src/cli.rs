@@ -33,7 +33,7 @@ pub struct Cli {
     #[arg(
         long = "endpoint",
         env = "DUMPER_S3_ENDPOINT",
-        help = "Custom S3 endpoint URL (e.g. MinIO, Cloudflare R2, Garage)"
+        help = "Custom S3 endpoint URL (e.g. Garage, Cloudflare R2, AWS S3)"
     )]
     pub endpoint: Option<String>,
 

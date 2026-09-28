@@ -20,7 +20,7 @@ Dumper operates as a client-side backup appliance. The primary trust boundary is
             └─────────────────────┘               │
                                                   │
                        ───────────────────────────┼──► Remote Object Storage / Disk
-                                                  │    (S3 / MinIO / Local Directory)
+                                                  │    (S3 / Garage / Local Directory)
                                                   │
 ```
 
