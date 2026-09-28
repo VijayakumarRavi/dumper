@@ -11,16 +11,11 @@
       let
         pkgs = import nixpkgs {
           inherit system;
-          config = {
-            permittedInsecurePackages = [
-              "minio-2025-10-15T17-29-55Z"
-            ];
-          };
         };
 
         dumperPkg = pkgs.rustPlatform.buildRustPackage {
           pname = "dumper";
-          version = "0.2.0";
+          version = "0.2.1";
           src = ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;
@@ -62,7 +57,6 @@
             # Integration testing servers & tools
             postgresql
             mariadb
-            minio
             garage
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             apple-sdk_15
@@ -77,7 +71,7 @@
             echo " 🚀 Dumper Development Environment Active"
             echo " Rust: $(rustc --version)"
             echo " Cargo: $(cargo --version)"
-            echo " Testing tools: postgresql, mariadb, minio, garage available"
+            echo " Testing tools: postgresql, mariadb, garage available"
             echo "=================================================================="
           '';
         };
