@@ -36,10 +36,10 @@ The following versions target the same wire protocols and SQL dialects, but are 
 
 ### Continuous Integration (CI) Storage Validation
 
-| Backend              | Protocol                | CI Testing Status  | Details                                                                                                                                                            |
-| -------------------- | ----------------------- | :----------------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Local Filesystem** | POSIX / Windows / macOS | **Verified in CI** | Atomic rename writes, directory sharding (`data/xx/yyyy...`), path traversal protection                                                                            |
-| **Garage S3**        | S3 REST / SigV4         | **Verified in CI** | Automated daemon & process tests on Linux & macOS; multipart uploads, SigV4 authentication, path-style addressing, HTTP 403/404/429/503 error injection             |
+| Backend              | Protocol                | CI Testing Status  | Details                                                                                                                                                 |
+| -------------------- | ----------------------- | :----------------: | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Local Filesystem** | POSIX / Windows / macOS | **Verified in CI** | Atomic rename writes, directory sharding (`data/xx/yyyy...`), path traversal protection                                                                 |
+| **Garage S3**        | S3 REST / SigV4         | **Verified in CI** | Automated daemon & process tests on Linux & macOS; multipart uploads, SigV4 authentication, path-style addressing, HTTP 403/404/429/503 error injection |
 
 ### S3-Compatible Cloud Providers (Target Supported via S3 API)
 
