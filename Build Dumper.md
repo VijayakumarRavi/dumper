@@ -1338,6 +1338,7 @@ Example:
 ```bash
 dumper forget \
   --keep-last 7 \
+  --keep-hourly 24 \
   --keep-daily 14 \
   --keep-weekly 8 \
   --keep-monthly 12
@@ -2490,6 +2491,7 @@ dumper restore \
 dumper forget \
   --repository s3://prod-backups/postgres \
   --keep-last 7 \
+  --keep-hourly 24 \
   --keep-daily 14 \
   --keep-weekly 8 \
   --keep-monthly 12

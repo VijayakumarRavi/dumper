@@ -373,3 +373,88 @@ async fn test_abandoned_temp_files_cleanup_and_detection() {
     assert!(!fake_tmp1.exists());
     assert!(!fake_tmp2.exists());
 }
+
+#[tokio::test]
+async fn test_forget_retention_policy_keep_hourly_lifecycle() {
+    use chrono::{TimeZone, Utc};
+    use dumper::cli::ForgetArgs;
+    use dumper::retention::evaluate_retention;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(LocalBackend::new(temp_dir.path()).await.unwrap());
+    let engine = RepositoryEngine::init(backend.clone(), "test-pass")
+        .await
+        .unwrap();
+
+    let block = b"dummy table payload";
+    let hash = hex::encode(Sha256::digest(block));
+    let (ref_blob, _) = engine
+        .put_chunk(block, &hash, CompressionLevel::Default)
+        .await
+        .unwrap();
+
+    // Create 3 snapshots across different hours:
+    // hour 14, hour 13, hour 12
+    let times = [
+        Utc.with_ymd_and_hms(2026, 9, 28, 14, 30, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 9, 28, 13, 15, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap(),
+    ];
+    let ids = ["snap0014", "snap0013", "snap0012"];
+
+    for (id, time) in ids.iter().zip(times.iter()) {
+        let snap = SnapshotMetadata {
+            id: (*id).into(),
+            full_id: format!("full_{}", id),
+            format_version: 1,
+            dumper_version: "0.2.0".into(),
+            engine: "postgresql".into(),
+            database: "test_db".into(),
+            server_version: "17".into(),
+            started_at: *time,
+            completed_at: *time,
+            duration_seconds: 1,
+            logical_bytes: block.len() as u64,
+            stored_bytes: block.len() as u64,
+            deduplicated_bytes: 0,
+            table_count: 1,
+            compression: "default".into(),
+            tag: None,
+            blobs: vec![ref_blob.clone()],
+        };
+        engine.commit_snapshot(&snap).await.unwrap();
+    }
+
+    let snapshots = engine.list_snapshots().await.unwrap();
+    assert_eq!(snapshots.len(), 3);
+
+    // Apply policy: keep-hourly 2
+    let policy = ForgetArgs {
+        keep_last: None,
+        keep_hourly: Some(2),
+        keep_daily: None,
+        keep_weekly: None,
+        keep_monthly: None,
+        database: None,
+        tag: None,
+        prune: false,
+        dry_run: false,
+    };
+
+    let plan = evaluate_retention(&snapshots, &policy);
+    assert_eq!(plan.keep.len(), 2);
+    assert_eq!(plan.remove.len(), 1);
+    assert_eq!(plan.remove[0].id, "snap0012");
+
+    // Execute deletion like `dumper forget`
+    for s in plan.remove {
+        engine.delete_snapshot(&s.id).await.unwrap();
+    }
+
+    let remaining = engine.list_snapshots().await.unwrap();
+    assert_eq!(remaining.len(), 2);
+    let remaining_ids: Vec<&str> = remaining.iter().map(|s| s.id.as_str()).collect();
+    assert!(remaining_ids.contains(&"snap0014"));
+    assert!(remaining_ids.contains(&"snap0013"));
+    assert!(!remaining_ids.contains(&"snap0012"));
+}

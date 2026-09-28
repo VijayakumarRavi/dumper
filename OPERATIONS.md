@@ -83,6 +83,7 @@ Schedule retention policy evaluation and garbage collection once per week:
 ```bash
 dumper forget \
   --keep-last 7 \
+  --keep-hourly 24 \
   --keep-daily 14 \
   --keep-weekly 8 \
   --keep-monthly 12 \

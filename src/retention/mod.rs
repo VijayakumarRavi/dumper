@@ -21,6 +21,7 @@ pub fn evaluate_retention<'a>(
 
     // If no retention flag was set, keep everything by default
     if policy.keep_last.is_none()
+        && policy.keep_hourly.is_none()
         && policy.keep_daily.is_none()
         && policy.keep_weekly.is_none()
         && policy.keep_monthly.is_none()
@@ -76,7 +77,18 @@ pub fn evaluate_retention<'a>(
             }
         }
 
-        // 2. Keep Daily N
+        // 2. Keep Hourly N
+        if let Some(n) = policy.keep_hourly {
+            let mut seen_hours = BTreeSet::new();
+            for s in &group_snapshots {
+                let hour_key = s.started_at.format("%Y-%m-%d %H").to_string();
+                if seen_hours.len() < n && seen_hours.insert(hour_key) {
+                    kept_ids.insert(s.id.clone());
+                }
+            }
+        }
+
+        // 3. Keep Daily N
         if let Some(n) = policy.keep_daily {
             let mut seen_days = BTreeSet::new();
             for s in &group_snapshots {
@@ -87,7 +99,7 @@ pub fn evaluate_retention<'a>(
             }
         }
 
-        // 3. Keep Weekly N
+        // 4. Keep Weekly N
         if let Some(n) = policy.keep_weekly {
             let mut seen_weeks = BTreeSet::new();
             for s in &group_snapshots {
@@ -102,7 +114,7 @@ pub fn evaluate_retention<'a>(
             }
         }
 
-        // 4. Keep Monthly N
+        // 5. Keep Monthly N
         if let Some(n) = policy.keep_monthly {
             let mut seen_months = BTreeSet::new();
             for s in &group_snapshots {
@@ -131,16 +143,15 @@ pub fn evaluate_retention<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, TimeZone, Utc};
 
-    fn make_snapshot(
+    fn make_snapshot_at(
         id: &str,
         db: &str,
         engine: &str,
         tag: Option<&str>,
-        age_days: i64,
+        time: DateTime<Utc>,
     ) -> SnapshotMetadata {
-        let time = Utc::now() - Duration::days(age_days);
         SnapshotMetadata {
             id: id.into(),
             full_id: format!("full_{}", id),
@@ -162,6 +173,16 @@ mod tests {
         }
     }
 
+    fn make_snapshot(
+        id: &str,
+        db: &str,
+        engine: &str,
+        tag: Option<&str>,
+        age_days: i64,
+    ) -> SnapshotMetadata {
+        make_snapshot_at(id, db, engine, tag, Utc::now() - Duration::days(age_days))
+    }
+
     #[test]
     fn test_keep_last() {
         let s1 = make_snapshot("s1", "test", "postgresql", None, 0);
@@ -171,6 +192,7 @@ mod tests {
 
         let policy = ForgetArgs {
             keep_last: Some(2),
+            keep_hourly: None,
             keep_daily: None,
             keep_weekly: None,
             keep_monthly: None,
@@ -186,6 +208,183 @@ mod tests {
         assert_eq!(plan.keep[0].id, "s1");
         assert_eq!(plan.keep[1].id, "s2");
         assert_eq!(plan.remove[0].id, "s3");
+    }
+
+    #[test]
+    fn test_keep_hourly_basic() {
+        let t1 = Utc.with_ymd_and_hms(2026, 9, 28, 10, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 9, 28, 11, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap();
+        let t4 = Utc.with_ymd_and_hms(2026, 9, 28, 13, 0, 0).unwrap();
+
+        let s1 = make_snapshot_at("s1", "test", "postgresql", None, t1);
+        let s2 = make_snapshot_at("s2", "test", "postgresql", None, t2);
+        let s3 = make_snapshot_at("s3", "test", "postgresql", None, t3);
+        let s4 = make_snapshot_at("s4", "test", "postgresql", None, t4);
+        let list = vec![s4, s3, s2, s1];
+
+        // Keep last 2 hours
+        let policy = ForgetArgs {
+            keep_last: None,
+            keep_hourly: Some(2),
+            keep_daily: None,
+            keep_weekly: None,
+            keep_monthly: None,
+            database: None,
+            tag: None,
+            prune: false,
+            dry_run: false,
+        };
+
+        let plan = evaluate_retention(&list, &policy);
+        assert_eq!(plan.keep.len(), 2);
+        assert_eq!(plan.remove.len(), 2);
+        assert_eq!(plan.keep[0].id, "s4"); // 13:00
+        assert_eq!(plan.keep[1].id, "s3"); // 12:00
+        assert_eq!(plan.remove[0].id, "s2"); // 11:00
+        assert_eq!(plan.remove[1].id, "s1"); // 10:00
+    }
+
+    #[test]
+    fn test_keep_hourly_multiple_in_same_hour() {
+        // Hour 14 has two snapshots: 14:10 and 14:40
+        let t_14_early = Utc.with_ymd_and_hms(2026, 9, 28, 14, 10, 0).unwrap();
+        let t_14_late = Utc.with_ymd_and_hms(2026, 9, 28, 14, 40, 0).unwrap();
+
+        // Hour 13 has two snapshots: 13:15 and 13:50
+        let t_13_early = Utc.with_ymd_and_hms(2026, 9, 28, 13, 15, 0).unwrap();
+        let t_13_late = Utc.with_ymd_and_hms(2026, 9, 28, 13, 50, 0).unwrap();
+
+        // Hour 12 has one snapshot: 12:00
+        let t_12 = Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap();
+
+        let s_14_early = make_snapshot_at("s_14_early", "test", "postgresql", None, t_14_early);
+        let s_14_late = make_snapshot_at("s_14_late", "test", "postgresql", None, t_14_late);
+        let s_13_early = make_snapshot_at("s_13_early", "test", "postgresql", None, t_13_early);
+        let s_13_late = make_snapshot_at("s_13_late", "test", "postgresql", None, t_13_late);
+        let s_12 = make_snapshot_at("s_12", "test", "postgresql", None, t_12);
+
+        let list = vec![s_14_late, s_14_early, s_13_late, s_13_early, s_12];
+
+        // Keep 2 hourly snapshots: must select the newest snapshot in each hour (14:40 and 13:50)
+        let policy = ForgetArgs {
+            keep_last: None,
+            keep_hourly: Some(2),
+            keep_daily: None,
+            keep_weekly: None,
+            keep_monthly: None,
+            database: None,
+            tag: None,
+            prune: false,
+            dry_run: false,
+        };
+
+        let plan = evaluate_retention(&list, &policy);
+        assert_eq!(plan.keep.len(), 2);
+        assert_eq!(plan.remove.len(), 3);
+
+        let kept_ids: Vec<&str> = plan.keep.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            kept_ids.contains(&"s_14_late"),
+            "Must keep latest snapshot from hour 14"
+        );
+        assert!(
+            kept_ids.contains(&"s_13_late"),
+            "Must keep latest snapshot from hour 13"
+        );
+
+        let removed_ids: Vec<&str> = plan.remove.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            removed_ids.contains(&"s_14_early"),
+            "Must remove earlier snapshot in hour 14"
+        );
+        assert!(
+            removed_ids.contains(&"s_13_early"),
+            "Must remove earlier snapshot in hour 13"
+        );
+        assert!(
+            removed_ids.contains(&"s_12"),
+            "Must remove snapshot from older hour 12"
+        );
+    }
+
+    #[test]
+    fn test_keep_hourly_combined_with_keep_last() {
+        let t_14_early = Utc.with_ymd_and_hms(2026, 9, 28, 14, 10, 0).unwrap();
+        let t_14_late = Utc.with_ymd_and_hms(2026, 9, 28, 14, 40, 0).unwrap();
+        let t_13 = Utc.with_ymd_and_hms(2026, 9, 28, 13, 0, 0).unwrap();
+
+        let s1 = make_snapshot_at("s1", "test", "postgresql", None, t_14_late);
+        let s2 = make_snapshot_at("s2", "test", "postgresql", None, t_14_early);
+        let s3 = make_snapshot_at("s3", "test", "postgresql", None, t_13);
+
+        let list = vec![s1, s2, s3];
+
+        // keep-last 2 keeps s1 and s2. keep-hourly 1 keeps s1. Combined should keep both s1 and s2.
+        let policy = ForgetArgs {
+            keep_last: Some(2),
+            keep_hourly: Some(1),
+            keep_daily: None,
+            keep_weekly: None,
+            keep_monthly: None,
+            database: None,
+            tag: None,
+            prune: false,
+            dry_run: false,
+        };
+
+        let plan = evaluate_retention(&list, &policy);
+        assert_eq!(plan.keep.len(), 2);
+        assert_eq!(plan.remove.len(), 1);
+        assert_eq!(plan.remove[0].id, "s3");
+    }
+
+    #[test]
+    fn test_keep_hourly_combined_with_keep_daily() {
+        // Day 1
+        let d1_morning = Utc.with_ymd_and_hms(2026, 9, 27, 10, 0, 0).unwrap();
+        let d1_evening = Utc.with_ymd_and_hms(2026, 9, 27, 18, 0, 0).unwrap();
+
+        // Day 2
+        let d2_h8 = Utc.with_ymd_and_hms(2026, 9, 28, 8, 0, 0).unwrap();
+        let d2_h9 = Utc.with_ymd_and_hms(2026, 9, 28, 9, 0, 0).unwrap();
+        let d2_h10 = Utc.with_ymd_and_hms(2026, 9, 28, 10, 0, 0).unwrap();
+
+        let s_d1_m = make_snapshot_at("d1_m", "test", "postgresql", None, d1_morning);
+        let s_d1_e = make_snapshot_at("d1_e", "test", "postgresql", None, d1_evening);
+        let s_d2_8 = make_snapshot_at("d2_8", "test", "postgresql", None, d2_h8);
+        let s_d2_9 = make_snapshot_at("d2_9", "test", "postgresql", None, d2_h9);
+        let s_d2_10 = make_snapshot_at("d2_10", "test", "postgresql", None, d2_h10);
+
+        let list = vec![s_d2_10, s_d2_9, s_d2_8, s_d1_e, s_d1_m];
+
+        // Keep 2 hourly (d2_10, d2_9) + keep 2 daily (d2_10, d1_e)
+        // Kept union: d2_10, d2_9, d1_e
+        // Removed: d2_8, d1_m
+        let policy = ForgetArgs {
+            keep_last: None,
+            keep_hourly: Some(2),
+            keep_daily: Some(2),
+            keep_weekly: None,
+            keep_monthly: None,
+            database: None,
+            tag: None,
+            prune: false,
+            dry_run: false,
+        };
+
+        let plan = evaluate_retention(&list, &policy);
+        assert_eq!(plan.keep.len(), 3);
+        assert_eq!(plan.remove.len(), 2);
+
+        let kept_ids: Vec<&str> = plan.keep.iter().map(|s| s.id.as_str()).collect();
+        assert!(kept_ids.contains(&"d2_10"));
+        assert!(kept_ids.contains(&"d2_9"));
+        assert!(kept_ids.contains(&"d1_e"));
+
+        let removed_ids: Vec<&str> = plan.remove.iter().map(|s| s.id.as_str()).collect();
+        assert!(removed_ids.contains(&"d2_8"));
+        assert!(removed_ids.contains(&"d1_m"));
     }
 
     #[test]
@@ -208,6 +407,7 @@ mod tests {
         // Keep last 2 snapshots PER database
         let policy = ForgetArgs {
             keep_last: Some(2),
+            keep_hourly: None,
             keep_daily: None,
             keep_weekly: None,
             keep_monthly: None,
@@ -247,6 +447,7 @@ mod tests {
         // Only apply policy to db_users
         let policy = ForgetArgs {
             keep_last: Some(1),
+            keep_hourly: None,
             keep_daily: None,
             keep_weekly: None,
             keep_monthly: None,
@@ -274,6 +475,7 @@ mod tests {
 
         let policy = ForgetArgs {
             keep_last: Some(1),
+            keep_hourly: None,
             keep_daily: None,
             keep_weekly: None,
             keep_monthly: None,

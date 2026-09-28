@@ -105,7 +105,7 @@ dumper restore 7c4f9c3a --target postgres://postgres:secret@recovery-host:5432/p
 
 ```bash
 # Forget older snapshots based on retention policies
-dumper forget --keep-last 7 --keep-daily 14 --keep-weekly 8 --keep-monthly 12 --prune
+dumper forget --keep-last 7 --keep-hourly 24 --keep-daily 14 --keep-weekly 8 --keep-monthly 12 --prune
 ```
 
 ### 7. Repository Statistics

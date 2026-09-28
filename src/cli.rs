@@ -203,6 +203,12 @@ pub struct ForgetArgs {
     pub keep_last: Option<usize>,
 
     #[arg(
+        long = "keep-hourly",
+        help = "Keep 1 snapshot per hour for the last N hours with backups"
+    )]
+    pub keep_hourly: Option<usize>,
+
+    #[arg(
         long = "keep-daily",
         help = "Keep 1 snapshot per day for the last N days with backups"
     )]
@@ -258,4 +264,31 @@ pub struct StatsArgs {
 pub struct UnlockArgs {
     #[arg(long = "force", help = "Force removal of locks even if not expired")]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_forget_args_keep_hourly_parsing() {
+        let cli = Cli::try_parse_from([
+            "dumper",
+            "forget",
+            "--keep-hourly",
+            "24",
+            "--keep-daily",
+            "7",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Forget(args) => {
+                assert_eq!(args.keep_hourly, Some(24));
+                assert_eq!(args.keep_daily, Some(7));
+                assert_eq!(args.keep_last, None);
+            }
+            _ => panic!("Expected Forget command"),
+        }
+    }
 }
