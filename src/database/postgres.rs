@@ -98,7 +98,7 @@ fn decode_base64_der(input: &str) -> Result<Vec<u8>, DumperError> {
         ));
     }
     let mut out = Vec::with_capacity((clean.len() * 3) / 4);
-    for chunk in clean.chunks_exact(4) {
+    for chunk in clean.as_chunks::<4>().0 {
         let b0 = decode_char(chunk[0])
             .ok_or_else(|| DumperError::Database("Invalid base64 character".into()))?;
         let b1 = decode_char(chunk[1])
