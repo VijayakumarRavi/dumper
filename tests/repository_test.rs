@@ -472,3 +472,101 @@ async fn test_forget_retention_policy_keep_hourly_lifecycle() {
     assert!(remaining_ids.contains(&"snap0013"));
     assert!(!remaining_ids.contains(&"snap0012"));
 }
+
+#[tokio::test]
+async fn test_repository_check_handles_nonce_starting_with_json_brace_and_legacy_snapshots() {
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit},
+        XChaCha20Poly1305, XNonce,
+    };
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(LocalBackend::new(temp_dir.path()).await.unwrap());
+    let password = "compat-test-password-456";
+    let engine = RepositoryEngine::init(backend.clone(), password)
+        .await
+        .unwrap();
+
+    let chunk = b"test row data for integrity check";
+    let hash = hex::encode(Sha256::digest(chunk));
+    let (blob_ref, _) = engine
+        .put_chunk(chunk, &hash, CompressionLevel::Default)
+        .await
+        .unwrap();
+
+    let master_key = engine.config.unlock(password).unwrap();
+
+    // 1. Commit snapshot with nonce starting with '{' (0x7B)
+    let snap_brace = SnapshotMetadata {
+        id: "snap_brace".into(),
+        full_id: "snap_brace_full_id".into(),
+        format_version: 1,
+        dumper_version: "0.2.2".into(),
+        engine: "postgresql".into(),
+        database: "brace_db".into(),
+        server_version: "16".into(),
+        started_at: chrono::Utc::now(),
+        completed_at: chrono::Utc::now(),
+        duration_seconds: 1,
+        logical_bytes: chunk.len() as u64,
+        stored_bytes: blob_ref.stored_size,
+        deduplicated_bytes: 0,
+        table_count: 1,
+        compression: "default".into(),
+        tag: None,
+        blobs: vec![blob_ref.clone()],
+    };
+    let json_bytes = serde_json::to_vec(&snap_brace).unwrap();
+    let cipher = XChaCha20Poly1305::new_from_slice(&master_key[..]).unwrap();
+    let mut nonce_bytes = [0u8; 24];
+    nonce_bytes[0] = b'{';
+    nonce_bytes[1] = 0x88;
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher.encrypt(nonce, json_bytes.as_slice()).unwrap();
+    let mut encrypted_payload = Vec::with_capacity(24 + ciphertext.len());
+    encrypted_payload.extend_from_slice(&nonce_bytes);
+    encrypted_payload.extend_from_slice(&ciphertext);
+    assert_eq!(encrypted_payload[0], b'{');
+    backend
+        .put_object("snapshots/snap_brace", &encrypted_payload)
+        .await
+        .unwrap();
+
+    // 2. Put legacy unencrypted JSON snapshot
+    let legacy_snap = SnapshotMetadata {
+        id: "snap_leg".into(),
+        full_id: "snap_leg_full_id".into(),
+        format_version: 1,
+        dumper_version: "0.1.0".into(),
+        engine: "postgresql".into(),
+        database: "leg_db".into(),
+        server_version: "15".into(),
+        started_at: chrono::Utc::now() - chrono::Duration::hours(1),
+        completed_at: chrono::Utc::now() - chrono::Duration::hours(1),
+        duration_seconds: 1,
+        logical_bytes: chunk.len() as u64,
+        stored_bytes: blob_ref.stored_size,
+        deduplicated_bytes: 0,
+        table_count: 1,
+        compression: "default".into(),
+        tag: None,
+        blobs: vec![blob_ref],
+    };
+    let legacy_json = serde_json::to_vec_pretty(&legacy_snap).unwrap();
+    backend
+        .put_object("snapshots/snap_leg", &legacy_json)
+        .await
+        .unwrap();
+
+    // 3. check() must verify both snapshots and report 2 total snapshots, 0 missing, 0 orphaned
+    let (total, missing, orphaned) = engine.check().await.unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(missing, 0);
+    assert_eq!(orphaned, 0);
+
+    // 4. list_snapshots must return both snapshots sorted newest first
+    let snapshots = engine.list_snapshots().await.unwrap();
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0].id, "snap_brace");
+    assert_eq!(snapshots[1].id, "snap_leg");
+}
