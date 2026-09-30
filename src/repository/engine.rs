@@ -165,13 +165,19 @@ impl<B: StorageBackend> RepositoryEngine<B> {
     /// Helper to decode snapshot metadata, supporting both authenticated encrypted format
     /// (SEC-01) and legacy plaintext JSON for backward compatibility.
     fn decode_snapshot_data(&self, data: &[u8]) -> Result<SnapshotMetadata, DumperError> {
-        let json_bytes = if !data.is_empty() && data[0] == b'{' {
-            data.to_vec()
-        } else {
-            decrypt_blob(&self.master_key, data)?
-        };
-        serde_json::from_slice::<SnapshotMetadata>(&json_bytes)
-            .map_err(|e| DumperError::Format(format!("Failed to parse snapshot metadata: {}", e)))
+        // Attempt decryption under repository master key first (standard encrypted format)
+        match decrypt_blob(&self.master_key, data) {
+            Ok(decrypted) => serde_json::from_slice::<SnapshotMetadata>(&decrypted).map_err(|e| {
+                DumperError::Format(format!("Failed to parse snapshot metadata: {}", e))
+            }),
+            Err(decrypt_err) => {
+                // If decryption failed, check if this is a legacy unencrypted JSON snapshot
+                match serde_json::from_slice::<SnapshotMetadata>(data) {
+                    Ok(snapshot) => Ok(snapshot),
+                    Err(_) => Err(decrypt_err),
+                }
+            }
+        }
     }
 
     /// Commit a snapshot atomically with encryption under repository master key (SEC-01)
@@ -413,8 +419,9 @@ mod tests {
 
         // SEC-01: Verify that raw stored snapshot bytes on disk are encrypted (not plain JSON)
         let raw_snap_bytes = backend.get_object("snapshots/12345678").await.unwrap();
-        assert!(!raw_snap_bytes.starts_with(b"{"));
         assert!(serde_json::from_slice::<SnapshotMetadata>(&raw_snap_bytes).is_err());
+        let decrypted_bytes = decrypt_blob(&engine.master_key, &raw_snap_bytes).unwrap();
+        assert_eq!(decrypted_bytes, serde_json::to_vec(&snapshot).unwrap());
 
         // SEC-05: Tampering with stored blob triggers AEAD authentication failure before decompression
         let blob_path = SnapshotMetadata::blob_path(&hash1);
@@ -443,5 +450,134 @@ mod tests {
         assert_eq!(snapshots_cnt, 1);
         assert_eq!(missing_cnt, 0);
         assert_eq!(orphaned_cnt, 0);
+    }
+
+    #[tokio::test]
+    async fn test_decode_snapshot_with_nonce_starting_with_brace() {
+        use chacha20poly1305::{
+            aead::{Aead, KeyInit},
+            XChaCha20Poly1305, XNonce,
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(LocalBackend::new(temp_dir.path()).await.unwrap());
+        let password = "test-nonce-brace-password";
+        let engine = RepositoryEngine::init(backend.clone(), password)
+            .await
+            .unwrap();
+
+        let snapshot = SnapshotMetadata {
+            id: "snap_brace".into(),
+            full_id: "snap_brace_full_id_12345".into(),
+            format_version: 1,
+            dumper_version: "0.2.2".into(),
+            engine: "postgresql".into(),
+            database: "test_db".into(),
+            server_version: "16".into(),
+            started_at: chrono::Utc::now(),
+            completed_at: chrono::Utc::now(),
+            duration_seconds: 5,
+            logical_bytes: 1024,
+            stored_bytes: 512,
+            deduplicated_bytes: 0,
+            table_count: 2,
+            compression: "default".into(),
+            tag: None,
+            blobs: vec![],
+        };
+
+        let json_bytes = serde_json::to_vec(&snapshot).unwrap();
+
+        // Construct encrypted snapshot with nonce[0] == b'{' (0x7B)
+        // This simulates the 1-in-256 random chance where the AEAD nonce starts with ASCII '{'
+        let cipher = XChaCha20Poly1305::new_from_slice(&engine.master_key[..]).unwrap();
+        let mut nonce_bytes = [0u8; 24];
+        nonce_bytes[0] = b'{';
+        nonce_bytes[1] = 0xAA; // Arbitrary non-JSON byte
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, json_bytes.as_slice()).unwrap();
+
+        let mut encrypted_payload = Vec::with_capacity(24 + ciphertext.len());
+        encrypted_payload.extend_from_slice(&nonce_bytes);
+        encrypted_payload.extend_from_slice(&ciphertext);
+
+        // Verify the raw encrypted payload starts with '{'
+        assert_eq!(encrypted_payload[0], b'{');
+
+        // Store this snapshot in repository
+        let path = SnapshotMetadata::snapshot_path(&snapshot.id);
+        backend.put_object(&path, &encrypted_payload).await.unwrap();
+
+        // 1. decode_snapshot_data must successfully decrypt and decode
+        let decoded = engine.decode_snapshot_data(&encrypted_payload).unwrap();
+        assert_eq!(decoded.id, "snap_brace");
+        assert_eq!(decoded.database, "test_db");
+
+        // 2. list_snapshots must successfully parse this snapshot without failing
+        let snapshots = engine.list_snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].id, "snap_brace");
+
+        // 3. check() must succeed with zero errors
+        let (total_snaps, missing_blobs, orphaned_blobs) = engine.check().await.unwrap();
+        assert_eq!(total_snaps, 1);
+        assert_eq!(missing_blobs, 0);
+        assert_eq!(orphaned_blobs, 0);
+
+        // 4. find_snapshot must find it
+        let found = engine.find_snapshot("snap_brace").await.unwrap();
+        assert_eq!(found.id, "snap_brace");
+    }
+
+    #[tokio::test]
+    async fn test_decode_legacy_unencrypted_snapshot() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(LocalBackend::new(temp_dir.path()).await.unwrap());
+        let password = "test-legacy-password";
+        let engine = RepositoryEngine::init(backend.clone(), password)
+            .await
+            .unwrap();
+
+        let legacy_snapshot = SnapshotMetadata {
+            id: "legacy_snap".into(),
+            full_id: "legacy_snap_full_id_67890".into(),
+            format_version: 1,
+            dumper_version: "0.1.0".into(),
+            engine: "mysql".into(),
+            database: "legacy_db".into(),
+            server_version: "8.0".into(),
+            started_at: chrono::Utc::now(),
+            completed_at: chrono::Utc::now(),
+            duration_seconds: 10,
+            logical_bytes: 2048,
+            stored_bytes: 1024,
+            deduplicated_bytes: 0,
+            table_count: 5,
+            compression: "default".into(),
+            tag: None,
+            blobs: vec![],
+        };
+
+        // Write as plaintext JSON (legacy pre-SEC-01 format)
+        let json_bytes = serde_json::to_vec_pretty(&legacy_snapshot).unwrap();
+        assert!(json_bytes.starts_with(b"{\n") || json_bytes.starts_with(b"{"));
+        let path = SnapshotMetadata::snapshot_path(&legacy_snapshot.id);
+        backend.put_object(&path, &json_bytes).await.unwrap();
+
+        // 1. decode_snapshot_data must fallback to plaintext JSON parsing and succeed
+        let decoded = engine.decode_snapshot_data(&json_bytes).unwrap();
+        assert_eq!(decoded.id, "legacy_snap");
+        assert_eq!(decoded.database, "legacy_db");
+
+        // 2. list_snapshots must successfully list legacy snapshot
+        let snapshots = engine.list_snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].id, "legacy_snap");
+
+        // 3. check() must succeed
+        let (total_snaps, missing_blobs, orphaned_blobs) = engine.check().await.unwrap();
+        assert_eq!(total_snaps, 1);
+        assert_eq!(missing_blobs, 0);
+        assert_eq!(orphaned_blobs, 0);
     }
 }
