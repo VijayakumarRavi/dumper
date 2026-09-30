@@ -7,20 +7,25 @@ Dumper `v0.2.2` is a bugfix release addressing snapshot table column alignment, 
 ## What's New in v0.2.2
 
 ### 1. Snapshot Table Column Alignment Fix
+
 - **Header Alignment**: Corrected the column spacing in `dumper snapshots`. Previously, 16-hex-character snapshot IDs pushed all subsequent headers (`DATE`, `ENGINE`, `DATABASE`, `LOGICAL`, `STORED`) 6 spaces out of alignment with their respective column values. The ID column is now properly budgeted to 16 characters.
 
 ### 2. Local Timezone Display
+
 - **System Timezone Formatting**: Snapshot timestamps in `dumper snapshots` and `dumper info` are now automatically converted and displayed in the system's local timezone (e.g., IST, EST, CEST) using `chrono::Local`.
 - **Automatic UTC Fallback**: If the local timezone is unavailable (such as in minimal container environments without timezone data), Dumper gracefully falls back to UTC.
 
 ### 3. Restic-Compatible Listing UX
+
 - **Column Header Modernization**: The `DATE` column header is now named `Time`, and all headers use clean Title Case (`ID`, `Time`, `Engine`, `Database`, `Logical`, `Stored`).
 - **Footer Metadata**: Added a closing separator line along with `Timestamps shown in local time` and a snapshot count summary (`N snapshots`), matching Restic's CLI conventions.
 
 ### 4. Short-Prefix Snapshot Resolution
+
 - **8-Character Prefix Support**: `dumper verify <ID>` and `dumper restore <ID>` now resolve snapshots by their 8-character short prefix in addition to exact IDs and full SHA-256 hashes, improving command-line ergonomics.
 
 ### 5. CI & Script Robustness
+
 - **Garage S3 Setup**: Fixed bash subshell expansion syntax in GitHub Actions CI workflow.
 - **Pipefail Safety**: Prevented SIGPIPE (141) under pipefail when extracting snapshot IDs from JSON output in E2E validation scripts.
 
