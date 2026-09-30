@@ -5,6 +5,13 @@ All notable changes to Dumper will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-09-30
+
+### Fixed
+
+- Fixed an intermittent failure in `dumper check`, `dumper snapshots`, and snapshot lookups where encrypted snapshots whose random 24-byte AEAD nonce started with `0x7B` (ASCII `{`, occurring in ~1 out of 256 backups) bypassed decryption due to a naive JSON detection heuristic, triggering `Format error: Failed to parse snapshot metadata: key must be a string at line 1 column 2`.
+- Updated snapshot metadata decoding to attempt authenticated AEAD decryption under the master key first, falling back to JSON parsing only for legacy unencrypted snapshots.
+
 ## [0.2.2] - 2026-09-29
 
 ### Fixed
