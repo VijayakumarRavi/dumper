@@ -232,6 +232,7 @@ impl<B: StorageBackend> RepositoryEngine<B> {
                 ))
             })?;
             if snapshot.id == id_query
+                || snapshot.id.starts_with(id_query)
                 || snapshot.full_id == id_query
                 || snapshot.full_id.starts_with(id_query)
             {
@@ -245,7 +246,10 @@ impl<B: StorageBackend> RepositoryEngine<B> {
         for key in keys {
             if let Ok(data) = self.backend.get_object(&key).await {
                 if let Ok(s) = self.decode_snapshot_data(&data) {
-                    if s.id == id_query || s.full_id == id_query || s.full_id.starts_with(id_query)
+                    if s.id == id_query
+                        || s.id.starts_with(id_query)
+                        || s.full_id == id_query
+                        || s.full_id.starts_with(id_query)
                     {
                         return Ok(s);
                     }

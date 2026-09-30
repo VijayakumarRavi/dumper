@@ -80,9 +80,12 @@ dumper snapshots
 Output:
 
 ```text
-ID          DATE                  ENGINE        DATABASE      LOGICAL     STORED    
---------------------------------------------------------------------------------
-7c4f9c3a    2026-09-08 02:00:01   postgresql    production    8.70 GiB    1.40 GiB
+ID                Time                 Engine        Database        Logical     Stored
+------------------------------------------------------------------------------------------
+7c4f9c3a01234567  2026-09-08 02:00:01  postgresql    production      8.70 GiB    1.40 GiB
+------------------------------------------------------------------------------------------
+Timestamps shown in local time
+1 snapshot
 ```
 
 ### 4. Verify Snapshot Data Integrity

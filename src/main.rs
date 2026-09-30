@@ -13,6 +13,7 @@ use dumper::stats::{compute_stats, print_stats_table};
 use dumper::stream::decoder::StreamDecoder;
 use dumper::stream::encoder::StreamEncoder;
 use dumper::ui::progress::{format_bytes, format_duration, ProgressEvent, ProgressReporter};
+use dumper::ui::table::format_snapshots_table;
 use sha2::Digest;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -318,23 +319,7 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
             } else if snapshots.is_empty() {
                 println!("No snapshots found in repository.");
             } else {
-                println!(
-                    "{:<10}  {:<20}  {:<12}  {:<12}  {:<10}  {:<10}",
-                    "ID", "DATE", "ENGINE", "DATABASE", "LOGICAL", "STORED"
-                );
-                println!("{}", "-".repeat(80));
-                for s in snapshots {
-                    let date_str = s.started_at.format("%Y-%m-%d %H:%M:%S").to_string();
-                    println!(
-                        "{:<10}  {:<20}  {:<12}  {:<12}  {:<10}  {:<10}",
-                        s.id,
-                        date_str,
-                        s.engine,
-                        s.database,
-                        format_bytes(s.logical_bytes),
-                        format_bytes(s.stored_bytes)
-                    );
-                }
+                print!("{}", format_snapshots_table(&snapshots));
             }
             Ok(())
         }
@@ -350,8 +335,14 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                 println!("Database Engine:   {}", snapshot.engine);
                 println!("Database Name:     {}", snapshot.database);
                 println!("Server Version:    {}", snapshot.server_version);
-                println!("Started At:        {}", snapshot.started_at);
-                println!("Completed At:      {}", snapshot.completed_at);
+                println!(
+                    "Started At:        {}",
+                    snapshot.started_at.with_timezone(&chrono::Local)
+                );
+                println!(
+                    "Completed At:      {}",
+                    snapshot.completed_at.with_timezone(&chrono::Local)
+                );
                 println!(
                     "Duration:          {}",
                     format_duration(snapshot.duration_seconds)

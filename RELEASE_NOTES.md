@@ -1,43 +1,35 @@
-# Dumper v0.2.1
+# Dumper v0.2.2
 
-Dumper `v0.2.1` is a maintenance and security release bringing Garage S3 migration, critical security audit hardenings, restic-compatible hourly retention policies, and compiler modernization.
+Dumper `v0.2.2` is a bugfix release addressing snapshot table column alignment, displaying snapshot timestamps in local system time, adopting Restic-compatible listing UX, and supporting short snapshot prefix resolution.
 
 ---
 
-## What's New in v0.2.1
+## What's New in v0.2.2
 
-### 1. S3 Backend: Migration to Garage S3
+### 1. Snapshot Table Column Alignment Fix
+- **Header Alignment**: Corrected the column spacing in `dumper snapshots`. Previously, 16-hex-character snapshot IDs pushed all subsequent headers (`DATE`, `ENGINE`, `DATABASE`, `LOGICAL`, `STORED`) 6 spaces out of alignment with their respective column values. The ID column is now properly budgeted to 16 characters.
 
-- **Test Infrastructure & CI**: Migrated local S3 test harnesses (`tests/s3_storage_test.rs` and `tests/crash_safety_test.rs`) and GitHub Actions E2E workflows from MinIO to **Garage S3** (v1.3.1), providing a lightweight, modern, open-source S3 testing environment.
-- **Nix Dev Shell**: Cleaned `flake.nix` by removing outdated insecure package overrides and bundling `garage` directly into the development shell.
-- **Documentation**: Updated `COMPATIBILITY.md`, `README.md`, `THREAT_MODEL.md`, and CLI references to reflect Garage S3 compatibility and setup.
+### 2. Local Timezone Display
+- **System Timezone Formatting**: Snapshot timestamps in `dumper snapshots` and `dumper info` are now automatically converted and displayed in the system's local timezone (e.g., IST, EST, CEST) using `chrono::Local`.
+- **Automatic UTC Fallback**: If the local timezone is unavailable (such as in minimal container environments without timezone data), Dumper gracefully falls back to UTC.
 
-### 2. Security & Cryptographic Hardening (SEC-01 through SEC-10)
+### 3. Restic-Compatible Listing UX
+- **Column Header Modernization**: The `DATE` column header is now named `Time`, and all headers use clean Title Case (`ID`, `Time`, `Engine`, `Database`, `Logical`, `Stored`).
+- **Footer Metadata**: Added a closing separator line along with `Timestamps shown in local time` and a snapshot count summary (`N snapshots`), matching Restic's CLI conventions.
 
-- **Snapshot Metadata Encryption**: Snapshot metadata files (`snapshots/<id>`) are now fully encrypted under the repository master key via authenticated AEAD envelopes (`XChaCha20-Poly1305`), preventing metadata leaks on shared storage backends.
-- **Authenticated Lock Release**: `dumper unlock` now validates repository credentials and master keys before modifying lock records.
-- **Custom TLS & CA Verification**:
-  - Added `--s3-ca-cert <PATH>` CLI option for verifying S3 endpoints against custom private CA certificates.
-  - Added `sslrootcert` parameter support in PostgreSQL connection strings for strict server certificate validation.
-- **Atomic Single-Transaction Restores**: Added `--single-transaction` flag to PostgreSQL restore pipelines, executing schema and data recreation in a single transaction block (`BEGIN` / `COMMIT`) to prevent partial restoration on failures.
-- **AEAD Tamper Proofing**: Moved the internal compression indicator byte into the authenticated plaintext payload prior to encryption, preventing unauthenticated oracle manipulation.
-- **Strict POSIX Permissions**: Automatically enforces `0700` on directories and `0600` on files created in local filesystem repositories.
+### 4. Short-Prefix Snapshot Resolution
+- **8-Character Prefix Support**: `dumper verify <ID>` and `dumper restore <ID>` now resolve snapshots by their 8-character short prefix in addition to exact IDs and full SHA-256 hashes, improving command-line ergonomics.
 
-### 3. Retention Policies
-
-- **Hourly Backup Retention**: Added `--keep-hourly <N>` to `dumper forget`, providing restic-compatible retention semantics to preserve the latest snapshot in each hourly window across the last N hours of backup activity.
-
-### 4. Code Quality & Rust 1.98 Modernization
-
-- Addressed Rust 1.98 `chunks_exact_to_as_chunks` clippy lints in PostgreSQL SSL certificate decoding.
-- Maintained 100% test pass rate across all 39 unit, integration, and crash-safety tests.
+### 5. CI & Script Robustness
+- **Garage S3 Setup**: Fixed bash subshell expansion syntax in GitHub Actions CI workflow.
+- **Pipefail Safety**: Prevented SIGPIPE (141) under pipefail when extracting snapshot IDs from JSON output in E2E validation scripts.
 
 ---
 
 ## Upgrade & Compatibility
 
-- **Repository Format**: Repositories created with `v0.2.0` remain compatible; existing plaintext snapshots can still be read and verified, while new snapshots will have encrypted metadata.
-- **CLI Options**: Backward compatible with all existing flags; new `--single-transaction`, `--s3-ca-cert`, and `--keep-hourly` options are opt-in.
+- **Fully Backward Compatible**: No repository format changes. Existing repositories and snapshots work without modification.
+- **Machine-Readable API Stability**: The `--json` flag output remains stable and continues to emit ISO-8601/RFC3339 UTC timestamps.
 
 ---
 

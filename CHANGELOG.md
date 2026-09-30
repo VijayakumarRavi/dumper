@@ -5,6 +5,23 @@ All notable changes to Dumper will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-09-29
+
+### Fixed
+
+- Fixed `dumper snapshots` table column alignment where 16-hex-character snapshot IDs pushed all subsequent headers (`DATE`, `ENGINE`, `DATABASE`, `LOGICAL`, `STORED`) 6 spaces out of alignment.
+- Snapshot dates in `dumper snapshots` and `dumper info` are now formatted in the system's local timezone (via `chrono::Local`), automatically falling back to UTC if the system timezone cannot be determined.
+- Fixed subshell expansion syntax in CI Garage S3 setup and prevented SIGPIPE under pipefail in E2E snapshot extraction scripts.
+
+### Added
+
+- Adapted `dumper snapshots` table formatting to match Restic's UX:
+  - `Time` column header replacing `DATE`.
+  - Title-cased column headers (`ID`, `Time`, `Engine`, `Database`, `Logical`, `Stored`).
+  - Closing separator line matching the header rule.
+  - Footer notes displaying `Timestamps shown in local time` and snapshot count summary (`N snapshots`).
+- Added short-prefix ID resolution in `find_snapshot` to match on `snapshot.id.starts_with(id_query)`, allowing operators to reference snapshots by their 8-character short prefixes in commands like `verify` and `restore`.
+
 ## [0.2.1] - 2026-09-28
 
 ### Added
