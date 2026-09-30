@@ -12,7 +12,7 @@ Dumper `v0.2.2` is a bugfix release addressing snapshot table column alignment, 
 
 ### 2. Local Timezone Display
 
-- **System Timezone Formatting**: Snapshot timestamps in `dumper snapshots` and `dumper info` are now automatically converted and displayed in the system's local timezone (e.g., IST, EST, CEST) using `chrono::Local`.
+- **System Timezone Formatting**: Snapshot timestamps in `dumper snapshots` and `dumper info` are now automatically converted and displayed in the system's local timezone (e.g., EST, CEST, local offset) using `chrono::Local`.
 - **Automatic UTC Fallback**: If the local timezone is unavailable (such as in minimal container environments without timezone data), Dumper gracefully falls back to UTC.
 
 ### 3. Restic-Compatible Listing UX

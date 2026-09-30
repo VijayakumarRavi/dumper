@@ -85,7 +85,7 @@ mod tests {
     fn test_snapshots_table_column_alignment() {
         let utc_dt = Utc.with_ymd_and_hms(2026, 9, 29, 3, 31, 2).unwrap();
         let s1 = make_test_snapshot("aeac215a407add9e", utc_dt);
-        let mut s2 = make_test_snapshot("1caf59a82f9528e7", utc_dt);
+        let mut s2 = make_test_snapshot("1cef59a82f9528e7", utc_dt);
         s2.engine = "mysql".into();
         s2.database = "vaultwarden".into();
         s2.logical_bytes = 3 * 1024 * 1024 + 800 * 1024;
@@ -119,7 +119,7 @@ mod tests {
         // ID: index 0
         assert!(header.starts_with("ID"));
         assert!(row1.starts_with("aeac215a407add9e"));
-        assert!(row2.starts_with("1caf59a82f9528e7"));
+        assert!(row2.starts_with("1cef59a82f9528e7"));
 
         // Time: index 18
         assert_eq!(&header[18..22], "Time");
