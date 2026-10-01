@@ -500,7 +500,7 @@ impl DatabaseAdapter for PostgresAdapter {
             engine: "postgresql".into(),
             database: database.clone(),
             server_version: server_version.clone(),
-            dumper_version: env!("CARGO_PKG_VERSION").into(),
+            dumper_version: crate::VERSION.into(),
             start_time: chrono::Utc::now().timestamp(),
         };
         encoder.write_record(&StreamRecord::Header(header)).await?;

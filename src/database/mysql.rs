@@ -170,7 +170,7 @@ impl DatabaseAdapter for MysqlAdapter {
             engine: meta.engine.clone(),
             database: meta.database.clone(),
             server_version: meta.server_version.clone(),
-            dumper_version: env!("CARGO_PKG_VERSION").into(),
+            dumper_version: crate::VERSION.into(),
             start_time: chrono::Utc::now().timestamp(),
         };
         encoder.write_record(&StreamRecord::Header(header)).await?;

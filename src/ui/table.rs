@@ -55,7 +55,7 @@ mod tests {
             id: id.to_string(),
             full_id: "0123456789abcdef0123456789abcdef".into(),
             format_version: 1,
-            dumper_version: "0.2.1".into(),
+            dumper_version: crate::VERSION.into(),
             engine: "postgresql".into(),
             database: "openbao".into(),
             server_version: "16.2".into(),

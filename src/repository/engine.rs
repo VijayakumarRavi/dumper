@@ -470,7 +470,7 @@ mod tests {
             id: "snap_brace".into(),
             full_id: "snap_brace_full_id_12345".into(),
             format_version: 1,
-            dumper_version: "0.2.3".into(),
+            dumper_version: crate::VERSION.into(),
             engine: "postgresql".into(),
             database: "test_db".into(),
             server_version: "16".into(),
