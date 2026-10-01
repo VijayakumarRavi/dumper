@@ -145,7 +145,9 @@ impl<W: AsyncWrite + Unpin + Send> StreamEncoder<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::format::{StreamHeader, StreamRecord, RecordType, STREAM_MAGIC, MAX_PAYLOAD_SIZE};
+    use crate::stream::format::{
+        RecordType, StreamHeader, StreamRecord, MAX_PAYLOAD_SIZE, STREAM_MAGIC,
+    };
 
     #[tokio::test]
     async fn test_encoder_initial_state() {
