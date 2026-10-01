@@ -17,6 +17,29 @@ pub enum RecordType {
     Trailer = 0xFF,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_record_type_try_from() {
+        // Valid cases
+        assert_eq!(RecordType::try_from(0x01), Ok(RecordType::Header));
+        assert_eq!(RecordType::try_from(0x02), Ok(RecordType::PreData));
+        assert_eq!(RecordType::try_from(0x03), Ok(RecordType::TableSchema));
+        assert_eq!(RecordType::try_from(0x04), Ok(RecordType::TableDataSlice));
+        assert_eq!(RecordType::try_from(0x05), Ok(RecordType::Sequence));
+        assert_eq!(RecordType::try_from(0x06), Ok(RecordType::PostData));
+        assert_eq!(RecordType::try_from(0x07), Ok(RecordType::Routine));
+        assert_eq!(RecordType::try_from(0xFF), Ok(RecordType::Trailer));
+
+        // Invalid cases
+        assert_eq!(RecordType::try_from(0x00), Err(0x00));
+        assert_eq!(RecordType::try_from(0x08), Err(0x08));
+        assert_eq!(RecordType::try_from(0xFE), Err(0xFE));
+    }
+}
+
 impl TryFrom<u8> for RecordType {
     type Error = u8;
 
