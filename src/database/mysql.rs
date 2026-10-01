@@ -268,7 +268,12 @@ impl DatabaseAdapter for MysqlAdapter {
 
                 let mut row_values = Vec::new();
                 for col_idx in 0..row.len() {
-                    let val: mysql_async::Value = row.get(col_idx).unwrap();
+                    let val: mysql_async::Value = row.get(col_idx).ok_or_else(|| {
+                        DumperError::Database(format!(
+                            "Failed to get value for column index {} in table '{}'",
+                            col_idx, table
+                        ))
+                    })?;
                     let mval = match val {
                         mysql_async::Value::NULL => MysqlValue::Null,
                         mysql_async::Value::Bytes(b) => {
@@ -379,25 +384,37 @@ impl DatabaseAdapter for MysqlAdapter {
         }
 
         // 4. Triggers
-        let triggers: Vec<(String, String)> = conn
+        let triggers: Result<Vec<(String, String)>, DumperError> = conn
             .query_map("SHOW TRIGGERS", |mut row: mysql_async::Row| {
-                let stmt: String = row.take("Statement").unwrap();
-                let trigger: String = row.take("Trigger").unwrap();
-                let timing: String = row.take("Timing").unwrap();
-                let event: String = row.take("Event").unwrap();
-                let table: String = row.take("Table").unwrap();
-                let sql = format!(
-                    "CREATE TRIGGER {} {} {} ON {} FOR EACH ROW {}",
-                    quote_mysql_identifier(&trigger),
-                    timing,
-                    event,
-                    quote_mysql_identifier(&table),
-                    stmt
-                );
-                (trigger, sql)
+                let stmt: Option<String> = row.take("Statement");
+                let trigger: Option<String> = row.take("Trigger");
+                let timing: Option<String> = row.take("Timing");
+                let event: Option<String> = row.take("Event");
+                let table: Option<String> = row.take("Table");
+
+                if let (Some(stmt), Some(trigger), Some(timing), Some(event), Some(table)) =
+                    (stmt, trigger, timing, event, table)
+                {
+                    let sql = format!(
+                        "CREATE TRIGGER {} {} {} ON {} FOR EACH ROW {}",
+                        quote_mysql_identifier(&trigger),
+                        timing,
+                        event,
+                        quote_mysql_identifier(&table),
+                        stmt
+                    );
+                    Ok((trigger, sql))
+                } else {
+                    Err(DumperError::Database(
+                        "Missing expected columns in SHOW TRIGGERS result".into(),
+                    ))
+                }
             })
             .await
-            .map_err(|e| DumperError::Database(format!("Failed to query MySQL triggers: {}", e)))?;
+            .map_err(|e| DumperError::Database(format!("Failed to query MySQL triggers: {}", e)))?
+            .into_iter()
+            .collect();
+        let triggers = triggers?;
 
         for (trig_name, trig_sql) in triggers {
             encoder
@@ -411,15 +428,22 @@ impl DatabaseAdapter for MysqlAdapter {
         }
 
         // 5. Routines (Procedures and Functions)
-        let procs: Vec<String> = conn
+        let procs: Result<Vec<String>, DumperError> = conn
             .query_map(
                 "SHOW PROCEDURE STATUS WHERE Db = DATABASE()",
-                |mut row: mysql_async::Row| row.take("Name").unwrap(),
+                |mut row: mysql_async::Row| {
+                    row.take("Name").ok_or_else(|| {
+                        DumperError::Database(
+                            "Missing 'Name' column in SHOW PROCEDURE STATUS result".into(),
+                        )
+                    })
+                },
             )
             .await
-            .map_err(|e| {
-                DumperError::Database(format!("Failed to query MySQL procedures: {}", e))
-            })?;
+            .map_err(|e| DumperError::Database(format!("Failed to query MySQL procedures: {}", e)))?
+            .into_iter()
+            .collect();
+        let procs = procs?;
 
         for p in procs {
             let q = format!("SHOW CREATE PROCEDURE {}", quote_mysql_identifier(&p));
@@ -444,15 +468,22 @@ impl DatabaseAdapter for MysqlAdapter {
             }
         }
 
-        let funcs: Vec<String> = conn
+        let funcs: Result<Vec<String>, DumperError> = conn
             .query_map(
                 "SHOW FUNCTION STATUS WHERE Db = DATABASE()",
-                |mut row: mysql_async::Row| row.take("Name").unwrap(),
+                |mut row: mysql_async::Row| {
+                    row.take("Name").ok_or_else(|| {
+                        DumperError::Database(
+                            "Missing 'Name' column in SHOW FUNCTION STATUS result".into(),
+                        )
+                    })
+                },
             )
             .await
-            .map_err(|e| {
-                DumperError::Database(format!("Failed to query MySQL functions: {}", e))
-            })?;
+            .map_err(|e| DumperError::Database(format!("Failed to query MySQL functions: {}", e)))?
+            .into_iter()
+            .collect();
+        let funcs = funcs?;
 
         for f in funcs {
             let q = format!("SHOW CREATE FUNCTION {}", quote_mysql_identifier(&f));
