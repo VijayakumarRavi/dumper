@@ -660,10 +660,8 @@ impl DatabaseAdapter for PostgresAdapter {
             .await
             .map_err(|e| DumperError::Database(e.to_string()))?;
 
-        let mut table_columns_map: HashMap<
-            (String, String),
-            Vec<(String, String, bool, Option<String>)>,
-        > = HashMap::new();
+        type ColumnMetadata = (String, String, bool, Option<String>);
+        let mut table_columns_map: HashMap<(String, String), Vec<ColumnMetadata>> = HashMap::new();
         for crow in all_col_rows {
             let schema: String = crow.get(0);
             let table: String = crow.get(1);
