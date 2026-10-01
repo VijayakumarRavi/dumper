@@ -1266,7 +1266,7 @@ async fn test_postgres_restore_single_transaction_rollback_on_failure() {
             engine: "postgresql".into(),
             database: "single_tx_db".into(),
             server_version: "16".into(),
-            dumper_version: "0.2.0".into(),
+            dumper_version: dumper::VERSION.into(),
             start_time: 1700000000,
         };
         encoder

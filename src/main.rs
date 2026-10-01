@@ -264,7 +264,7 @@ async fn dispatch_engine_command<B: StorageBackend + 'static>(
                 id: snapshot_short_id.clone(),
                 full_id,
                 format_version: 1,
-                dumper_version: env!("CARGO_PKG_VERSION").into(),
+                dumper_version: dumper::VERSION.into(),
                 engine: backup_stats.engine.clone(),
                 database: backup_stats.database.clone(),
                 server_version: backup_stats.server_version.clone(),
