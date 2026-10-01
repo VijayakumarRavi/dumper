@@ -171,7 +171,8 @@ impl<R: AsyncRead + Unpin + Send> StreamDecoder<R> {
             }
             RecordType::Trailer => {
                 let t: StreamTrailer = serde_json::from_slice(&payload)?;
-                let expected_hash = pre_trailer_hash.unwrap();
+                let expected_hash = pre_trailer_hash
+                    .ok_or_else(|| DumperError::Integrity("Missing pre-trailer hash".into()))?;
                 if expected_hash != t.stream_hash_hex {
                     return Err(DumperError::Integrity(format!(
                         "Stream SHA-256 hash mismatch: expected {}, calculated {}",

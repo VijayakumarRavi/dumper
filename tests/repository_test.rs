@@ -501,7 +501,9 @@ async fn test_repository_check_handles_nonce_starting_with_json_brace_and_legacy
         id: "snap_brace".into(),
         full_id: "snap_brace_full_id".into(),
         format_version: 1,
+
         dumper_version: dumper::VERSION.into(),
+
         engine: "postgresql".into(),
         database: "brace_db".into(),
         server_version: "16".into(),
