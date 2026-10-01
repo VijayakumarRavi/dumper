@@ -381,7 +381,9 @@ impl DatabaseAdapter for MysqlAdapter {
         let triggers: Result<Vec<(String, String)>, DumperError> = conn
             .query_map("SHOW TRIGGERS", |mut row: mysql_async::Row| {
                 let stmt = row.take::<String, _>("Statement").ok_or_else(|| {
-                    DumperError::Database("Missing 'Statement' column in SHOW TRIGGERS result".into())
+                    DumperError::Database(
+                        "Missing 'Statement' column in SHOW TRIGGERS result".into(),
+                    )
                 })?;
                 let trigger = row.take::<String, _>("Trigger").ok_or_else(|| {
                     DumperError::Database("Missing 'Trigger' column in SHOW TRIGGERS result".into())
