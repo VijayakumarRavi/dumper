@@ -380,23 +380,22 @@ impl DatabaseAdapter for MysqlAdapter {
         // 4. Triggers
         let triggers: Result<Vec<(String, String)>, DumperError> = conn
             .query_map("SHOW TRIGGERS", |mut row: mysql_async::Row| {
-                let stmt = row.take::<String, _>("Statement").ok_or_else(|| {
-                    DumperError::Database(
-                        "Missing 'Statement' column in SHOW TRIGGERS result".into(),
-                    )
-                })?;
-                let trigger = row.take::<String, _>("Trigger").ok_or_else(|| {
-                    DumperError::Database("Missing 'Trigger' column in SHOW TRIGGERS result".into())
-                })?;
-                let timing = row.take::<String, _>("Timing").ok_or_else(|| {
-                    DumperError::Database("Missing 'Timing' column in SHOW TRIGGERS result".into())
-                })?;
-                let event = row.take::<String, _>("Event").ok_or_else(|| {
-                    DumperError::Database("Missing 'Event' column in SHOW TRIGGERS result".into())
-                })?;
-                let table = row.take::<String, _>("Table").ok_or_else(|| {
-                    DumperError::Database("Missing 'Table' column in SHOW TRIGGERS result".into())
-                })?;
+                let stmt: Option<String> = row.take("Statement");
+                let trigger: Option<String> = row.take("Trigger");
+                let timing: Option<String> = row.take("Timing");
+                let event: Option<String> = row.take("Event");
+                let table: Option<String> = row.take("Table");
+
+                let (stmt, trigger, timing, event, table) =
+                    match (stmt, trigger, timing, event, table) {
+                        (Some(s), Some(tr), Some(ti), Some(e), Some(ta)) => (s, tr, ti, e, ta),
+                        _ => {
+                            return Err(DumperError::Database(
+                                "Missing one or more required columns in SHOW TRIGGERS result"
+                                    .into(),
+                            ))
+                        }
+                    };
 
                 let sql = format!(
                     "CREATE TRIGGER {} {} {} ON {} FOR EACH ROW {}",
