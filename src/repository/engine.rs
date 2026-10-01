@@ -310,17 +310,27 @@ impl<B: StorageBackend> RepositoryEngine<B> {
 
     /// Verify a snapshot's blobs, encryption, decompression, and hashes
     pub async fn verify_snapshot(&self, snapshot: &SnapshotMetadata) -> Result<usize, DumperError> {
-        for (i, blob_ref) in snapshot.blobs.iter().enumerate() {
-            let _data = self.get_chunk(&blob_ref.hash).await.map_err(|e| {
-                DumperError::Integrity(format!(
-                    "Verification failed on blob {} ({}/{}): {}",
-                    blob_ref.hash,
-                    i + 1,
-                    snapshot.blobs.len(),
-                    e
-                ))
-            })?;
-        }
+        use futures_util::{StreamExt, TryStreamExt};
+
+        let stream = futures_util::stream::iter(snapshot.blobs.iter().enumerate()).map(
+            |(i, blob_ref)| async move {
+                let _data = self.get_chunk(&blob_ref.hash).await.map_err(|e| {
+                    DumperError::Integrity(format!(
+                        "Verification failed on blob {} ({}/{}): {}",
+                        blob_ref.hash,
+                        i + 1,
+                        snapshot.blobs.len(),
+                        e
+                    ))
+                })?;
+                Ok::<(), DumperError>(())
+            },
+        );
+
+        stream
+            .buffer_unordered(16)
+            .try_for_each(|_| async { Ok(()) })
+            .await?;
         Ok(snapshot.blobs.len())
     }
 
