@@ -405,7 +405,9 @@ impl DatabaseAdapter for MysqlAdapter {
                     );
                     Ok((trigger, sql))
                 } else {
-                    Err(DumperError::Database("Missing expected columns in SHOW TRIGGERS result".into()))
+                    Err(DumperError::Database(
+                        "Missing expected columns in SHOW TRIGGERS result".into(),
+                    ))
                 }
             })
             .await
@@ -431,14 +433,14 @@ impl DatabaseAdapter for MysqlAdapter {
                 "SHOW PROCEDURE STATUS WHERE Db = DATABASE()",
                 |mut row: mysql_async::Row| {
                     row.take("Name").ok_or_else(|| {
-                        DumperError::Database("Missing 'Name' column in SHOW PROCEDURE STATUS result".into())
+                        DumperError::Database(
+                            "Missing 'Name' column in SHOW PROCEDURE STATUS result".into(),
+                        )
                     })
                 },
             )
             .await
-            .map_err(|e| {
-                DumperError::Database(format!("Failed to query MySQL procedures: {}", e))
-            })?
+            .map_err(|e| DumperError::Database(format!("Failed to query MySQL procedures: {}", e)))?
             .into_iter()
             .collect();
         let procs = procs?;
@@ -471,14 +473,14 @@ impl DatabaseAdapter for MysqlAdapter {
                 "SHOW FUNCTION STATUS WHERE Db = DATABASE()",
                 |mut row: mysql_async::Row| {
                     row.take("Name").ok_or_else(|| {
-                        DumperError::Database("Missing 'Name' column in SHOW FUNCTION STATUS result".into())
+                        DumperError::Database(
+                            "Missing 'Name' column in SHOW FUNCTION STATUS result".into(),
+                        )
                     })
                 },
             )
             .await
-            .map_err(|e| {
-                DumperError::Database(format!("Failed to query MySQL functions: {}", e))
-            })?
+            .map_err(|e| DumperError::Database(format!("Failed to query MySQL functions: {}", e)))?
             .into_iter()
             .collect();
         let funcs = funcs?;
