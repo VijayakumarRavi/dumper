@@ -196,10 +196,11 @@ fn sanitize_key_values(input: &str, keys: &[&str]) -> String {
 
             // Ensure key is preceded by start of string or a non-alphanumeric delimiter
             if key_pos > 0 {
-                let prev_char = result[..key_pos].chars().next_back().unwrap();
-                if prev_char.is_ascii_alphanumeric() || prev_char == '_' || prev_char == '-' {
-                    search_from = key_pos + key.len();
-                    continue;
+                if let Some(prev_char) = result[..key_pos].chars().next_back() {
+                    if prev_char.is_ascii_alphanumeric() || prev_char == '_' || prev_char == '-' {
+                        search_from = key_pos + key.len();
+                        continue;
+                    }
                 }
             }
 
