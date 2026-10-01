@@ -257,14 +257,8 @@ impl DatabaseAdapter for MysqlAdapter {
             while let Some(row) = result_stream.next().await.map_err(|e| {
                 DumperError::Database(format!("MySQL stream error on table '{}': {}", table, e))
             })? {
-                let binary_indices = match &binary_cols {
-                    Some(indices) => indices,
-                    None => {
-                        let indices = find_binary_columns(row.columns_ref());
-                        binary_cols = Some(indices);
-                        binary_cols.as_ref().unwrap()
-                    }
-                };
+                let binary_indices =
+                    binary_cols.get_or_insert_with(|| find_binary_columns(row.columns_ref()));
 
                 let mut row_values = Vec::new();
                 for col_idx in 0..row.len() {
