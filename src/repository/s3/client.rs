@@ -479,6 +479,35 @@ mod tests {
         let (bucket2, prefix2) = S3Client::parse_s3_url("s3://standalone-bucket").unwrap();
         assert_eq!(bucket2, "standalone-bucket");
         assert_eq!(prefix2, "");
+
+        let (bucket3, prefix3) = S3Client::parse_s3_url("s3://bucket/deep/nested/prefix").unwrap();
+        assert_eq!(bucket3, "bucket");
+        assert_eq!(prefix3, "deep/nested/prefix");
+
+        let (bucket4, prefix4) = S3Client::parse_s3_url("s3://bucket/").unwrap();
+        assert_eq!(bucket4, "bucket");
+        assert_eq!(prefix4, "");
+    }
+
+    #[test]
+    fn test_parse_s3_url_errors() {
+        let err = S3Client::parse_s3_url("http://my-backups/postgres").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Configuration error: Invalid S3 repository URL 'http://my-backups/postgres', must start with 's3://'"
+        );
+
+        let err2 = S3Client::parse_s3_url("s3://").unwrap_err();
+        assert_eq!(
+            err2.to_string(),
+            "Configuration error: S3 repository URL must specify a bucket name (e.g. s3://my-bucket/backups)"
+        );
+
+        let err3 = S3Client::parse_s3_url("s3:///prefix").unwrap_err();
+        assert_eq!(
+            err3.to_string(),
+            "Configuration error: S3 repository URL must specify a bucket name (e.g. s3://my-bucket/backups)"
+        );
     }
 
     #[test]
