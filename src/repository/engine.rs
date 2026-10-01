@@ -197,20 +197,20 @@ impl<B: StorageBackend> RepositoryEngine<B> {
     /// List all committed snapshots, sorted newest first
     pub async fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>, DumperError> {
         let keys = self.backend.list_objects("snapshots").await?;
-        let mut snapshots = Vec::new();
 
-        for key in keys {
+        let futures = keys.into_iter().map(|key| async move {
             let data = self.backend.get_object(&key).await.map_err(|e| {
                 DumperError::Repository(format!("Failed to read snapshot '{}': {}", key, e))
             })?;
-            let snapshot = self.decode_snapshot_data(&data).map_err(|e| {
+            self.decode_snapshot_data(&data).map_err(|e| {
                 DumperError::Format(format!(
                     "Failed to parse snapshot metadata in '{}': {}",
                     key, e
                 ))
-            })?;
-            snapshots.push(snapshot);
-        }
+            })
+        });
+
+        let mut snapshots = futures_util::future::try_join_all(futures).await?;
 
         snapshots.sort_by_key(|b| std::cmp::Reverse(b.started_at));
         Ok(snapshots)
