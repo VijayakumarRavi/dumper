@@ -631,55 +631,81 @@ impl DatabaseAdapter for PostgresAdapter {
                 .await?;
         }
 
+        // Prepare the array of full table identifiers for targeted fetching
+        let mut target_tables = Vec::new();
+        for (schema, table) in &table_names {
+            target_tables.push(format!("{}.{}", schema, table));
+        }
+
+        // Pre-fetch all column metadata for all target tables to avoid N+1 queries
+        // Using ANY($1) allows us to pass a list of schema.table strings
+        let all_col_rows = client
+            .query(
+                "SELECT \
+                    n.nspname::text, \
+                    c.relname::text, \
+                    a.attname::text, \
+                    format_type(a.atttypid, a.atttypmod), \
+                    not a.attnotnull, \
+                    pg_get_expr(d.adbin, d.adrelid) \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+                 WHERE (n.nspname || '.' || c.relname) = ANY($1) \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY n.nspname, c.relname, a.attnum",
+                &[&target_tables],
+            )
+            .await
+            .map_err(|e| DumperError::Database(e.to_string()))?;
+
+        let mut table_columns_map: HashMap<
+            (String, String),
+            Vec<(String, String, bool, Option<String>)>,
+        > = HashMap::new();
+        for crow in all_col_rows {
+            let schema: String = crow.get(0);
+            let table: String = crow.get(1);
+            let col_name: String = crow.get(2);
+            let data_type: String = crow.get(3);
+            let is_nullable: bool = crow.get(4);
+            let default_val: Option<String> = crow.get(5);
+
+            table_columns_map.entry((schema, table)).or_default().push((
+                col_name,
+                data_type,
+                is_nullable,
+                default_val,
+            ));
+        }
+
         // 4. Tables and Streaming COPY Data
         let mut tables_backed_up = 0;
         let total_rows = 0u64;
 
         for (schema, table) in &table_names {
-            // Columns metadata
-            let col_rows = client
-                .query(
-                    "SELECT \
-                        a.attname::text, \
-                        format_type(a.atttypid, a.atttypmod), \
-                        not a.attnotnull, \
-                        pg_get_expr(d.adbin, d.adrelid) \
-                     FROM pg_attribute a \
-                     JOIN pg_class c ON c.oid = a.attrelid \
-                     JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
-                     WHERE n.nspname = $1 AND c.relname = $2 \
-                       AND a.attnum > 0 AND NOT a.attisdropped \
-                     ORDER BY a.attnum",
-                    &[schema, table],
-                )
-                .await
-                .map_err(|e| DumperError::Database(e.to_string()))?;
-
             let mut columns = Vec::new();
             let mut col_defs = Vec::new();
 
-            for crow in col_rows {
-                let col_name: String = crow.get(0);
-                let data_type: String = crow.get(1);
-                let is_nullable: bool = crow.get(2);
-                let default_val: Option<String> = crow.get(3);
+            if let Some(cols) = table_columns_map.remove(&(schema.clone(), table.clone())) {
+                for (col_name, data_type, is_nullable, default_val) in cols {
+                    let mut def = format!("{} {}", quote_pg_identifier(&col_name), data_type);
+                    if !is_nullable {
+                        def.push_str(" NOT NULL");
+                    }
+                    if let Some(ref d) = default_val {
+                        def.push_str(&format!(" DEFAULT {}", d));
+                    }
+                    col_defs.push(def);
 
-                let mut def = format!("{} {}", quote_pg_identifier(&col_name), data_type);
-                if !is_nullable {
-                    def.push_str(" NOT NULL");
+                    columns.push(TableColumnMeta {
+                        name: col_name,
+                        data_type,
+                        is_nullable,
+                        default_val,
+                    });
                 }
-                if let Some(ref d) = default_val {
-                    def.push_str(&format!(" DEFAULT {}", d));
-                }
-                col_defs.push(def);
-
-                columns.push(TableColumnMeta {
-                    name: col_name,
-                    data_type,
-                    is_nullable,
-                    default_val,
-                });
             }
 
             let create_sql = format!(
